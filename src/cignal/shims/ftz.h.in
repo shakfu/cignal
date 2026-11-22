@@ -1,0 +1,35 @@
+/* Flush denormals to zero while the kernel runs, then restore the host's mode. Denormal arithmetic can
+   cost 100x per operation, and hosts differ: Debian's Pd 0.55 runs kernels with denormals flushed,
+   macOS Pd 0.57 does not. Other targets run unchanged. */
+#if defined(__x86_64__) || defined(__i386__)
+#include <xmmintrin.h>
+typedef unsigned int cignal_fp_mode;
+static inline cignal_fp_mode cignal_ftz_begin(void) {
+    cignal_fp_mode mode = _mm_getcsr();
+    _mm_setcsr(mode | 0x8040u); /* FTZ and DAZ */
+    return mode;
+}
+static inline void cignal_ftz_end(cignal_fp_mode mode) {
+    _mm_setcsr(mode);
+}
+#elif defined(__aarch64__)
+#include <stdint.h>
+typedef uint64_t cignal_fp_mode;
+static inline cignal_fp_mode cignal_ftz_begin(void) {
+    uint64_t mode;
+    __asm__ __volatile__("mrs %0, fpcr" : "=r"(mode));
+    __asm__ __volatile__("msr fpcr, %0" : : "r"(mode | ((uint64_t)1 << 24))); /* FZ */
+    return mode;
+}
+static inline void cignal_ftz_end(cignal_fp_mode mode) {
+    __asm__ __volatile__("msr fpcr, %0" : : "r"(mode));
+}
+#else
+typedef int cignal_fp_mode;
+static inline cignal_fp_mode cignal_ftz_begin(void) {
+    return 0;
+}
+static inline void cignal_ftz_end(cignal_fp_mode mode) {
+    (void)mode;
+}
+#endif

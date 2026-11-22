@@ -1,0 +1,41 @@
+[project]
+name = "cignal"
+version = "0.0.1"
+description = "Compile DSP kernels written in static Python to C99"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+cignal = "cignal.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.8.19,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.18.2",
+    "numpy>=2.3",
+    "pytest>=8.4.2",
+    "ruff>=0.13.1",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra -q --strict-markers --strict-config"
+testpaths = ["tests"]
+
+[tool.mypy]
+strict = true
+files = ["src/cignal"]
+
+[tool.ruff]
+line-length = 120
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+# `type f32 = float` is not callable, and kernels call f32(x) at runtime.
+ignore = ["UP040"]
