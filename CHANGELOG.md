@@ -4,7 +4,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ## [Unreleased]
 
-First version, 0.0.1. Milestones M0 to M5 are in [`docs/dev/spec.md`](docs/dev/spec.md) section 14.
+## [0.0.1]
+
+First version. Milestones M0 to M5 are in [`docs/dev/spec.md`](docs/dev/spec.md) section 14.
 
 ### Added
 
