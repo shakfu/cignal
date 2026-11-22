@@ -39,7 +39,7 @@ jobs:
         run: uv run ruff format --check src/ tests/
 
       - name: Type check with mypy
-        run: uv run mypy src/cignal tests/
+        run: uv run mypy
 
       - name: Run tests
         run: uv run pytest tests/ -v --cov=src/cignal --cov-report=xml
@@ -52,7 +52,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        python-version: ["3.10", "3.13"]
+        python-version: ["3.12", "3.14"]
 
     steps:
       - uses: actions/checkout@v7
