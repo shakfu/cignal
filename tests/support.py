@@ -87,6 +87,27 @@ CASES = [
             (3500, "gains_0", 0.0),
         ),
     ),
+    # A chord, a legato glide on voice 1, a release, a reset with gates still open, then a new note.
+    Case(
+        "poly.py",
+        "Poly",
+        (
+            (0, "freqs_0", 220.0),
+            (0, "gates_0", 1.0),
+            (600, "freqs_1", 330.0),
+            (600, "gates_1", 0.8),
+            (601, "freqs_2", 412.5),
+            (601, "gates_2", 0.6),
+            (1500, "gates_0", 0.0),
+            (2000, "freqs_1", 495.0),
+            (2600, "cutoff", 600.0),
+            (3000, "reset", 0.0),
+            (3700, "freqs_7", 7000.0),
+            (3700, "gates_7", 2.0),
+            (4100, "release", 0.002),
+            (4100, "gates_1", 0.0),
+        ),
+    ),
     Case("glide.py", "Glide", ((0, "level", 440.0), (2000, "level", 0.0))),
     Case("wavetable.py", "Wavetable", ((1700, "freq", 1234.5), (3100, "reset", 0.0), (3900, "freq", 99.0))),
 ]

@@ -24,6 +24,24 @@ Design questions are argued in [`docs/dev/spec.md`](docs/dev/spec.md) section 13
 
 - [x] **Float SNR threshold per case** (spec 9.1). The ladder passes at 90 dB.
 
+### Found by writing an 8-voice synth (2026-11-23)
+
+`tests/fixtures/poly.py`: saw, envelope and lowpass per voice, 19 parameters, 20 ns/frame on clang `-O2`.
+
+- [ ] **Notes are not events.** A gate is a parameter, so a note-off and note-on at the same frame collapse to the last value, and re-sending a held gate does nothing: a voice cannot retrigger. Options: a per-parameter "changed" flag readable in `control`, or event methods hosts call between blocks (an ABI addition).
+
+- [ ] **Voice allocation is the host's job.** The kernel cannot take "note 60, velocity 100"; the host must pick a voice and set `freqs_k` and `gates_k`. Event methods (above) would let the kernel allocate.
+
+- [ ] **`smooth=` state is `f32` in the float build.** Smoothing the voice frequency dropped the float SNR from 116 to 98 dB, because the phase integrates every rounding of the pitch. The fixture glides an `f64` field by hand instead. Option: keep smoother state in `f64`, or allow `f64` parameters.
+
+- [ ] **Hand-written glides repeat the snap rule.** The ladder experiment and this fixture both copied `smooth_step`'s snap to avoid a float stall. Option: a built-in `glide(value, target, coef)`, or `smooth=` on plain fields.
+
+- [ ] **Pd inlet count.** 19 parameters give 19 inlets. Option: a `name value` message on the left inlet (`freqs_3 440`); a shim-only change.
+
+- [ ] **A sub-kernel's `tick` must take `f32` samples**, even when only its parent calls it. The voice method is `play` to take an `f64` pitch. Minor: the rule could apply only to the exported kernel.
+
+- [ ] **Sub-kernels cannot read their parent.** Each voice call passes 7 shared values as arguments. Writing them into every voice in `control`, as Freeverb does, is the alternative. Minor.
+
 ## Medium
 
 ### Reference model

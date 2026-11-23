@@ -10,7 +10,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 - `Array[K, N]` of sub-kernels and `Array[Delay[T, M], N]` of delay lines, used through a proven index: `self.combs[i].tick(x)`. A file whose kernels are held only through such arrays no longer reports "several top-level kernels".
 
-- Freeverb and Moog-ladder fixtures, written to find what a real kernel needs; the three items above came from them. The float-build SNR threshold is now per case: the ladder self-oscillates at `res=1.1`, where the builds drift in phase, and passes at 90 dB (spec 9.1).
+- Freeverb, Moog-ladder and 8-voice synth fixtures, written to find what a real kernel needs; the items above came from them, and the synth's gaps are in `TODO.md`. The float-build SNR threshold is now per case: the ladder self-oscillates at `res=1.1`, where the builds drift in phase, and passes at 90 dB (spec 9.1).
 
 - `self.target("cutoff")` reads the value a parameter glides towards. It changes only between blocks, so `control` may read it, where reading the smoothed parameter is an error. On an unsmoothed parameter it reads the parameter. `target` is now a reserved method name.
 
