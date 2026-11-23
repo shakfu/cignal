@@ -113,6 +113,21 @@ CASES = [
     (RuleId.UNSUPPORTED_CALL, kernel(tick="return abs(x, x)"), 6),
     (RuleId.TYPE_MISMATCH, kernel(tick="return x if min(x > 0.0, x < 1.0) else x"), 6),
     (RuleId.MIXED_NUMERIC, kernel("n: i32 = 0", tick="return max(x, self.n)"), 7),
+    # Module-level tuples: indices are proven like Array indices; elements must fit the element type.
+    (RuleId.UNPROVEN_INDEX, HEADER + "T = (1.0, 2.0)\n" + FREE_CALLER.replace("f(x)", "T[i32(x)]"), 7),
+    (RuleId.CONSTANT_RANGE, HEADER + "T = (1.0, 2.0)\n" + FREE_CALLER.replace("f(x)", "T[2]"), 7),
+    (
+        RuleId.CONSTANT_RANGE,
+        HEADER
+        + "T = (2**40, 1)\n"
+        + FREE_CALLER.replace("return f(x)", "for i in range(2):\n            x += f32(T[i])\n        return x"),
+        8,
+    ),
+    (
+        RuleId.UNSUPPORTED_SYNTAX,
+        HEADER + "T = (1.0, 2.0)\n" + FREE_CALLER.replace("return f(x)", "T[0] = x\n        return x"),
+        7,
+    ),
     # A module that rebinds a built-in's name gets no built-in.
     (RuleId.UNSUPPORTED_CALL, HEADER + "abs = math.fabs\n" + FREE_CALLER.replace("f(x)", "abs(x)"), 7),
 ]

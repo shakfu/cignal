@@ -86,22 +86,38 @@ class Spec:
     """The annotation `Array[T, N]` or `Delay[T, N]` evaluates to one of these."""
 
     kind: type
-    element: type
+    element: Any  # a scalar type, a `Kernel` subclass, or a `Delay` spec
     size: int
 
 
 class Array(list[Any]):
-    """A fixed-length array field: `taps: Array[f32, 16]`. Zero-filled; indices must be provably in range."""
+    """A fixed-length array field: `taps: Array[f32, 16]`. Indices must be provably in range.
 
-    def __class_getitem__(cls, item: tuple[type, int]) -> Spec:  # type: ignore[override]
+    Elements are zeros, sub-kernels (`Array[Comb, 8]`) or delay lines (`Array[Delay[f32, N], 4]`).
+    """
+
+    def __class_getitem__(cls, item: tuple[Any, int]) -> Spec:  # type: ignore[override]
         return Spec(cls, item[0], item[1])
 
-    def __init__(self, spec: Spec) -> None:
-        self.zero = spec.element()
-        super().__init__(self.zero for _ in range(spec.size))
+    def __init__(self, spec: Spec, sample_rate: float = 0.0) -> None:
+        element: Any = spec.element
+        if isinstance(element, Spec):
+            super().__init__(element.kind(element) for _ in range(spec.size))
+        elif isinstance(element, type) and issubclass(element, Kernel):
+            super().__init__(element(sample_rate) for _ in range(spec.size))  # each runs `init`, in order
+        else:
+            self.zero = element()
+            super().__init__(self.zero for _ in range(spec.size))
 
     def clear(self) -> None:
-        self[:] = [self.zero] * len(self)
+        """Zero the elements, or reset each sub-kernel or delay line."""
+        for k, item in enumerate(self):
+            if isinstance(item, Kernel):
+                item._reset(keep_params=False)  # a sub-kernel's parameters are plain fields
+            elif isinstance(item, Delay):
+                item.clear()
+            else:
+                self[k] = self.zero
 
 
 class Delay:
@@ -171,7 +187,7 @@ class Kernel:
         }
         for name, hint in inspect.get_annotations(cls, eval_str=True).items():
             if isinstance(hint, Spec):
-                setattr(self, name, hint.kind(hint))
+                setattr(self, name, Array(hint, self.sample_rate) if hint.kind is Array else hint.kind(hint))
             elif isinstance(hint, type) and issubclass(hint, Kernel) and name not in vars(cls):
                 setattr(self, name, hint(sample_rate))
         self.init()

@@ -28,6 +28,8 @@ class Case:
     # to test that the setter clamps. Values are rounded to float32, like the signals, so every build
     # sees the same parameter.
     changes: tuple[Change, ...] = ()
+    # The float build's SNR against the double build (spec 9.1). Lower only for a measured reason.
+    min_snr_db: float = 100.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "changes", tuple((f, n, float(np.float32(v))) for f, n, v in self.changes))
@@ -62,6 +64,18 @@ CASES = [
     Case("drive.py", "Drive", ((1000, "drive", 3.0), (2500, "drive", 0.5), (3600, "drive", 10.0))),
     Case("ops.py", "Ops"),
     Case("builtins.py", "Builtins"),
+    Case(
+        "freeverb.py",
+        "Freeverb",
+        ((900, "room", 0.95), (2200, "reset", 0.0), (2500, "damp", 0.1), (3700, "wet", 2.0)),
+    ),
+    # Self-oscillating at res=1.1, the float build drifts in phase: 96.1 dB on silence_burst (spec 9.1).
+    Case(
+        "ladder.py",
+        "Ladder",
+        ((1000, "cutoff", 4000.0), (2001, "res", 1.1), (2900, "reset", 0.0), (3333, "cutoff", 200.0)),
+        min_snr_db=90.0,
+    ),
     Case("glide.py", "Glide", ((0, "level", 440.0), (2000, "level", 0.0))),
     Case("wavetable.py", "Wavetable", ((1700, "freq", 1234.5), (3100, "reset", 0.0), (3900, "freq", 99.0))),
 ]

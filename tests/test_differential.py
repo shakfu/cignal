@@ -9,8 +9,6 @@ from conftest import Driver
 from support import CASES, Case, reference, run_driver, signals, snr_db
 
 SIGNALS = signals()
-# Calibrated on M0 (spec 9.1): the lowest float-build SNR is the biquad's, at 106 dB.
-MIN_SNR_DB = 100.0
 BLOCK_PATTERNS = ["1", "7", "64", "128", "3,61,64,1", "4800"]
 
 
@@ -38,7 +36,7 @@ def test_float_build_snr(driver: Driver, case: Case, signal: str) -> None:
     x = SIGNALS[signal]
     expected = run_driver(driver(case, "double"), case, x, np.float64)
     actual = run_driver(driver(case, "float"), case, x, np.float32)
-    assert snr_db(expected, actual) >= MIN_SNR_DB
+    assert snr_db(expected, actual) >= case.min_snr_db
 
 
 @pytest.mark.parametrize("case", CASES, ids=str)

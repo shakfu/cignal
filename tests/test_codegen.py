@@ -161,3 +161,27 @@ def test_builtin_min_yields_to_a_module_function_and_folds_constants(tmp_path: P
     assert "cignal_fn_min(x, 2.0f)" in c
     assert "3.0f * fabsf(-x)" in c
     assert "cignal_min_" not in c and "cignal_max_" not in c
+
+
+def test_only_tuples_indexed_at_run_time_are_emitted(tmp_path: Path) -> None:
+    path = tmp_path / "k.py"
+    path.write_text(
+        textwrap.dedent("""
+        from cignal import Kernel, f32, i32
+
+        USED = (1, 2, 3)
+        FOLDED = (0.5, 0.25)
+        UNUSED = (9.0, 8.0)
+        FLAGS = (True, False)
+
+        class K(Kernel):
+            def tick(self, x: f32) -> f32:
+                for n in range(3):
+                    x += f32(USED[n]) * FOLDED[-1] if FLAGS[n % 2] else x
+                return x
+    """)
+    )
+    c = compile_kernel(path).source
+    assert "static const int32_t cignal_const_USED[3] = {\n    1, 2, 3\n};" in c
+    assert "static const bool cignal_const_FLAGS[2]" in c
+    assert "0.25f" in c and "cignal_const_FOLDED" not in c and "UNUSED" not in c

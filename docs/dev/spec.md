@@ -93,7 +93,7 @@ Rules:
 - Every field is declared at class level with an annotation. Assigning an undeclared `self.x` is an error (`CIGNAL.UNDECLARED_STATE`).
 - Scalar fields need a default. `Array`, `Delay` and sub-kernel fields are zero-filled or default-constructed.
 - `self.sample_rate: f32` is predefined and set by init.
-- A sub-kernel field gives one context per field. This replaces Vult's call-site contexts (section 12.1).
+- A sub-kernel field gives one context per field. This replaces Vult's call-site contexts (section 12.1). `Array[K, N]` gives `N` contexts (section 3.6).
 - Inheritance between kernels is out of scope for v1 (`CIGNAL.UNSUPPORTED_SYNTAX`).
 
 ### 3.3 Kernel methods
@@ -132,12 +132,15 @@ Rules:
 - A module-level `def` with full annotations, called from kernel code, becomes `static inline cignal_fn_<name>`. It has no `self` (`CIGNAL.UNKNOWN_NAME`) and may call tables, `math`, and other module-level functions.
 - A module-level function is lowered only when kernel code calls it. Build-time helpers, such as a coefficient design using SciPy, can sit in the same file without being valid kernel code.
 - The call graph, methods and functions together, must be acyclic (`CIGNAL.RECURSION`).
-- Module-level names that are not kernels, functions or imports are build-time constants (section 4). They may be numbers, booleans, or tuples of them. Tuples become `static const` arrays.
+- Module-level names that are not kernels, functions or imports are build-time constants (section 4). They may be numbers, booleans, or tuples of them.
+- A tuple is indexed like an `Array` and is read-only. Its element type is `i32` if every element is an int, `f32` if any is a float, and `bool` if all are bools. Mixing bools and numbers is not a tuple constant.
+- A constant index folds to the element, which then acts as a literal. A negative constant counts from the end, as in Python. Any other index follows section 5.4 and reads a `static const` array, emitted only for tuples indexed that way.
 
 ### 3.6 `Array` and `Delay`
 
 - Fields are written `taps: Array[f32, 16]` and `line: Delay[f32, 4800]`, with no default. `N` is evaluated in CPython, so any build-time expression works. Arrays are zero-filled.
 - `Array[T, N]`: `T` is any scalar type, `1 <= N <= 2**24`. Indexing must be provably in `[0, N)` (section 5.4). An array cannot be used as a value.
+- `Array[K, N]` for a kernel class `K` holds `N` sub-kernels, and `Array[Delay[T, M], N]` holds `N` delay lines. Elements are used through a proven index: `self.combs[i].tick(x)`, `self.lines[i].read(d)`. They initialise and reset in index order, at the field's place in field order. Freeverb's 8 combs need this: without it they are 8 named fields and unrolled loops.
 - `Delay[T, N]`: `T` is `f32` or `f64`, `2 <= N <= 2**24`. `kernel.Delay` defines the semantics; the C helpers follow it operation for operation.
   - `write(x)` stores the newest sample.
   - `read(d: i32)` returns the sample written `d` writes ago, with `d` clamped to `[1, N]`. `read(1)` is the newest, so `read(D)` before `write(x)` delays by exactly D samples.
@@ -223,7 +226,7 @@ CPython ints do not wrap. A kernel whose intermediate values leave `i32` still m
 
 ### 5.4 Index safety
 
-An `Array[T, N]` index is accepted if a local interval analysis shows it is in `[0, N)`. Accepted forms:
+An `Array[T, N]` index, or a runtime index into an `N`-element module tuple, is accepted if a local interval analysis shows it is in `[0, N)`. Accepted forms:
 
 - a build-time constant;
 - the variable of a `range` loop with constant bounds, over the values the range actually takes;
@@ -285,7 +288,7 @@ Generated code must contain no references to `malloc`, `free`, `printf`, locks, 
 
 `-ffast-math` is not the default because reassociation breaks the comparison with the `f64` reference. `cignal build --fast-math` adds the flags to the build recipe it prints, and the tests then switch to the SNR check only.
 
-Vectorisation note: a recursive filter (IIR) has a dependency between consecutive samples and does not vectorise along time. Stateless and FIR kernels can. Running several channels per instance is the later route to SIMD for IIR kernels and is out of scope for v1.
+Vectorisation note: a recursive filter (IIR) has a dependency between consecutive samples and does not vectorise along time. Stateless and FIR kernels can. For IIR kernels, `Array[K, N]` inside one kernel runs N voices in one instance: 2.2 to 3.4x faster than N instances, measured in [simd.md](simd.md). A struct-of-arrays layout for it adds 1.5 to 1.9x and stays bit-exact.
 
 ## 8. Host shims
 
@@ -345,6 +348,8 @@ M0 calibration:
 - Parameter values in tests are rounded to `float32`, like the signals, so both builds see the same parameter. The rounding of a decimal like 0.0333 is an input difference, not arithmetic error.
 
 M2 calibration: the lowest `float` SNRs are the biquad (106 dB), the resonant lowpass (107 dB) and the state-variable filter (115 dB). The echo reached 152 dB once its delay position was `f64`.
+
+The SNR threshold is per case (`Case.min_snr_db`), 100 dB unless a measurement justifies less. A self-oscillating filter drifts in phase between the builds, so SNR measures the drift, not arithmetic error. The ladder's float SNR fell with resonance: 125 dB at `res=0.3`, 107 dB at 1.0, 96 dB at 1.1, 91 dB at 1.2. Its case reaches `res=1.1` and passes at 90 dB.
 
 Contraction can also change a non-finite result, not just the last bit. In the `float` build, clang fused `a * b - a * b`, whose product overflows, into `fma(a, b, -inf)`. That gives `-inf` where CPython gives NaN. The `builtins` fixture computes `inf` and `inf - inf` in separate statements, because C never contracts across statements. A kernel that relies on an exact `inf - inf` must do the same, or build with `-ffp-contract=off`.
 
@@ -473,7 +478,7 @@ Sizing at init from the sample rate needs a size query before allocation, plus h
 3. **`i32` overflow in the reference.** The C side now wraps (section 5.3). Detecting a stored value that leaves range in the reference is still open. Option: a test-mode AST rewrite that asserts range. Cost: the reference is no longer exactly the user's source.
 4. **`f32` rounding in the reference.** Option: emulate `f32` through `numpy.float32` for bit-near comparison of the `float` build. Cost: a slower reference and NumPy at runtime.
 5. **Fixed-point output** (Vult's `-real fixed`, q16.16) for Teensy and Eurorack hardware. Only if hardware targets are near-term.
-6. **Multi-channel instances for SIMD** (section 7). This changes the ABI and should be decided before v1.0 freezes it.
+6. **Multi-channel instances for SIMD.** Measured: not needed, since `Array[K, N]` gives the parallelism ([simd.md](simd.md)). Open: whether field layout becomes ABI at v1.0. Making it not ABI would allow a struct-of-arrays `Array[K, N]` without a host change.
 
 ## 14. Milestones
 

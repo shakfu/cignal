@@ -4,6 +4,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ## [Unreleased]
 
+### Added
+
+- Module-level tuples can be indexed, as spec 3.5 already stated: a constant index folds, and any other index is proven in range like an `Array` index and reads a `static const` array. The element type is `i32` when every element is an int, so `COMBS[i]` keeps its integer meaning; one float makes the tuple `f32`.
+
+- `Array[K, N]` of sub-kernels and `Array[Delay[T, M], N]` of delay lines, used through a proven index: `self.combs[i].tick(x)`. A file whose kernels are held only through such arrays no longer reports "several top-level kernels".
+
+- Freeverb and Moog-ladder fixtures, written to find what a real kernel needs; the three items above came from them. The float-build SNR threshold is now per case: the ladder self-oscillates at `res=1.1`, where the builds drift in phase, and passes at 90 dB (spec 9.1).
+
 ## [0.0.2]
 
 ### Added

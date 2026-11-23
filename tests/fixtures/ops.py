@@ -1,4 +1,5 @@
-"""Exercises `//`, `**`, bitwise operators and shifts, chained comparisons, free functions and `while`.
+"""Exercises `//`, `**`, bitwise operators and shifts, chained comparisons, free functions, `while`, and
+indexed module-level tuples.
 
 Inputs are scaled by powers of two and divisors are exact, so the float and double builds compute the
 same integers and wrap at the same points.
@@ -9,6 +10,8 @@ import math
 from cignal import Kernel, f32, i32
 
 LCG_MUL = 1103515245
+STEPS = (3, -1, 4, -1)  # i32: every element is an int
+WEIGHTS = (0.5, 0.25, -0.125, 2)  # f32: one float makes the tuple f32
 
 
 def clamp(x: f32, lo: f32, hi: f32) -> f32:
@@ -37,4 +40,14 @@ class Ops(Kernel):
         while self.count >= 7:
             self.count -= 7
         inside = 1.0 if -0.25 < x < 0.25 else 0.0
-        return shape(x + n * 0.1) + f32(ints) * 1e-5 + floats * 0.01 + f32(self.count) * 0.01 + inside * 0.1
+        picked = WEIGHTS[q % 4] * f32(STEPS[(q + 1) % 4]) + WEIGHTS[-1] * f32(STEPS[0])  # constants fold
+        for k in range(4):
+            picked += WEIGHTS[k] * f32(STEPS[k])
+        return (
+            shape(x + n * 0.1)
+            + f32(ints) * 1e-5
+            + floats * 0.01
+            + f32(self.count) * 0.01
+            + inside * 0.1
+            + picked * 0.001
+        )

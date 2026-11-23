@@ -109,7 +109,7 @@ Both shims flush denormals to zero while the kernel runs, and restore the host's
 
 - **`i32` wraps** at 32 bits in C. CPython ints do not, so a value that leaves `i32` range is outside the contract, unless it is masked back into range.
 
-- **Sizes are build-time constants.** `Array[f32, 16]`, `Delay[f32, MAX]`, `@table(size=512, ...)`. Module-level constants and `math` expressions on them are folded in CPython.
+- **Sizes are build-time constants.** `Array[f32, 16]`, `Delay[f32, MAX]`, `Array[Comb, 8]` of sub-kernels, `@table(size=512, ...)`. Module-level constants and `math` expressions on them are folded in CPython.
 
 - **Array indices must be provably in range.** Use a constant, a `range` loop variable with constant bounds, or `e % N`. Anything else is a compile error, and there are no runtime bounds checks.
 

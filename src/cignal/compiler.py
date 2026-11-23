@@ -286,6 +286,11 @@ class Field:
     smooth: float = 0.0  # one-pole time constant in seconds, for a smoothed parameter
     array: tuple[str, int] | None = None  # (element type, length)
     delay: tuple[str, int] | None = None  # (element type, length)
+    count: int = 0  # > 0: an `Array` of `count` sub-kernels or delay lines
+
+    @property
+    def c_suffix(self) -> str:
+        return f"[{self.count}]" if self.count else ""
 
     @property
     def is_scalar(self) -> bool:
@@ -725,6 +730,10 @@ class _FunctionLowerer:
         if isinstance(node, ast.Call):
             return self._call(node)
         if isinstance(node, ast.Subscript):
+            if isinstance(node.value, ast.Name) and self._is_module_name(node.value.id):
+                found = self.program.const_tuple(node.value.id)
+                if found is not None:
+                    return self._tuple_index(node.value.id, *found, node)
             code, t = self._subscript(node)
             return _Expr(code, t)
         if isinstance(node, ast.Tuple):
@@ -765,10 +774,28 @@ class _FunctionLowerer:
                 return None
             prefix, _, model = base
             field_ = model.fields.get(node.attr)
-            if field_ is not None and field_.kernel is not None:
+            if field_ is not None and field_.kernel is not None and not field_.count:
                 member = f"{prefix}{c_name(node.attr)}"
                 return member + ".", f"&{member}", self.program.model(field_.kernel)
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute):
+            found = self._element(node)
+            if found is not None and found[1].kernel is not None:
+                member = found[0]
+                return member + ".", f"&{member}", self.program.model(found[1].kernel)
         return None
+
+    def _element(self, node: ast.Subscript) -> tuple[str, Field] | None:
+        """`self.xs[i]` for an `Array` of sub-kernels or delay lines: (C lvalue of the element, field)."""
+        assert isinstance(node.value, ast.Attribute)
+        base = self._receiver(node.value.value)
+        if base is None:
+            return None
+        prefix, _, model = base
+        field_ = model.fields.get(node.value.attr)
+        if field_ is None or not field_.count:
+            return None
+        index = self._proven_index(node.slice, self._expr(node.slice), field_.count)
+        return f"{prefix}{c_name(node.value.attr)}[{index}]", field_
 
     def _member(self, node: ast.Attribute) -> tuple[str, Field]:
         """Resolve `self.x` or `self.sub.x` to (C lvalue, field) for a field of any kind."""
@@ -812,19 +839,41 @@ class _FunctionLowerer:
         if field_.array is None:
             self._unsupported(node, f"subscript of `{ast.unparse(node.value)}`, which is not an `Array`")
         element, size = field_.array
-        if any(isinstance(n, ast.Call) for n in ast.walk(node.slice)):
-            self.errors.add(RuleId.UNPROVEN_INDEX, "an index may not contain calls", node.slice,
+        return f"{code}[{self._proven_index(node.slice, self._expr(node.slice), size)}]", element
+
+    def _proven_index(self, node: ast.expr, index: _Expr, size: int) -> str:
+        """The C code for `index`, which must be provably in [0, size) (section 5.4)."""
+        if any(isinstance(n, ast.Call) for n in ast.walk(node)):
+            self.errors.add(RuleId.UNPROVEN_INDEX, "an index may not contain calls", node,
                             "compute the index into a local first")  # fmt: skip
             raise _Abort
-        index = self._coerce(self._expr(node.slice), "i32", node.slice)
-        bounds = self._index_range(node.slice)
+        code = self._coerce(index, "i32", node)
+        bounds = self._index_range(node)
         if bounds is None or bounds[0] < 0 or bounds[1] >= size:
             found = "unknown" if bounds is None else f"[{bounds[0]}, {bounds[1]}]"
-            self.errors.add(RuleId.UNPROVEN_INDEX, f"index `{ast.unparse(node.slice)}` is not provably in "
-                            f"[0, {size - 1}] (found {found})", node.slice,
+            self.errors.add(RuleId.UNPROVEN_INDEX, f"index `{ast.unparse(node)}` is not provably in "
+                            f"[0, {size - 1}] (found {found})", node,
                             f"use a constant, a `range` variable with constant bounds, or `e % {size}`")  # fmt: skip
             raise _Abort
-        return f"{code}[{index}]", element
+        return code
+
+    def _is_module_name(self, name: str) -> bool:
+        return name not in self.loop_vars and name not in self.params and name not in self.locals
+
+    def _tuple_index(self, name: str, t: str, values: tuple[Number, ...], node: ast.Subscript) -> _Expr:
+        """`T[e]` for a module-level tuple `T`: folded for a constant `e`, else read from a `static const` array."""
+        index = self._expr(node.slice)
+        if index.is_const:
+            i = index.value
+            if isinstance(i, bool) or not isinstance(i, int) or not -len(values) <= i < len(values):
+                self.errors.add(RuleId.CONSTANT_RANGE, f"`{name}[{i!r}]` is outside a {len(values)}-element tuple",
+                                node.slice)  # fmt: skip
+                raise _Abort
+            return _Expr("", None, values[i])
+        code = self._proven_index(node.slice, index, len(values))
+        self.program.const_literals(name, t, values, node)
+        self.helpers.add(f"const_{name}")
+        return _Expr(f"cignal_const_{name}[{code}]", t)
 
     def _index_range(self, node: ast.expr) -> tuple[int, int] | None:
         """The interval an i32 index expression is proven to lie in, or None."""
@@ -1044,8 +1093,13 @@ class _FunctionLowerer:
                 return self._math(func.attr, node)
             if isinstance(func.value, ast.Attribute) and func.attr in _DELAY_METHODS:
                 code, field_ = self._member(func.value)
-                if field_.delay is not None:
+                if field_.delay is not None and not field_.count:
                     return self._delay_call(code, field_.delay, func.attr, node)
+            if (isinstance(func.value, ast.Subscript) and isinstance(func.value.value, ast.Attribute)
+                    and func.attr in _DELAY_METHODS):  # fmt: skip
+                found = self._element(func.value)
+                if found is not None and found[1].delay is not None:
+                    return self._delay_call(found[0], found[1].delay, func.attr, node)
             receiver = self._receiver(func.value)
             if receiver is not None:
                 return self._method_call(receiver, func.attr, node)
@@ -1367,23 +1421,48 @@ class _KernelModel:
             self.errors.add(RuleId.UNSUPPORTED_SYNTAX, f"`{label}` fields are written `{name}: {label}[f32, N]` "
                             "with no default", stmt)  # fmt: skip
             return
-        t = self.resolve_scalar(elts[0])
-        if t is None:
-            return
         spec = inspect.get_annotations(self.cls, eval_str=True).get(name)
-        size = spec.size if isinstance(spec, Spec) else None
-        minimum = 2 if kind is Delay else 1
+        assert isinstance(spec, Spec)
+        size = self._buffer_size(kind, spec, elts[1])
+        element = elts[0]
+        if kind is Array and isinstance(element, ast.Name) and element.id in self.program.classes:
+            if size is not None:
+                self.fields[name] = Field(name, None, kernel=element.id, count=size)
+            return
+        if kind is Array and isinstance(element, ast.Subscript) and isinstance(element.value, ast.Name):
+            if getattr(self.module, element.value.id, None) is Delay and isinstance(spec.element, Spec):
+                inner = element.slice.elts if isinstance(element.slice, ast.Tuple) else []
+                delay = self._delay(spec.element, inner) if len(inner) == 2 else None
+                if delay is not None and size is not None:
+                    self.fields[name] = Field(name, None, delay=delay, count=size)
+                return
+        if kind is Delay:
+            delay = self._delay(spec, elts)
+            if delay is not None:
+                self.fields[name] = Field(name, None, delay=delay)
+            return
+        t = self.resolve_scalar(element)
+        if t is not None and size is not None:
+            self.fields[name] = Field(name, None, array=(t, size))
+
+    def _buffer_size(self, kind: type, spec: Spec, node: ast.expr) -> int | None:
+        size, label, minimum = spec.size, kind.__name__, 2 if kind is Delay else 1
         if not isinstance(size, int) or isinstance(size, bool) or not minimum <= size <= MAX_BUFFER:
             self.errors.add(RuleId.CONSTANT_RANGE, f"`{label}` length must be an int in [{minimum}, {MAX_BUFFER}], "
-                            f"got {size!r}", elts[1])  # fmt: skip
-            return
-        if kind is Delay and t not in FLOAT_TYPES:
+                            f"got {size!r}", node)  # fmt: skip
+            return None
+        return size
+
+    def _delay(self, spec: Spec, elts: list[ast.expr]) -> tuple[str, int] | None:
+        """`Delay[T, N]`, alone or as an `Array` element: (element type, length)."""
+        t = self.resolve_scalar(elts[0])
+        size = self._buffer_size(Delay, spec, elts[1])
+        if t is None or size is None:
+            return None
+        if t not in FLOAT_TYPES:
             self.errors.add(RuleId.UNKNOWN_TYPE, f"`Delay` elements must be f32 or f64, not {t}", elts[0])
-            return
-        if kind is Delay:
-            self.fields[name] = Field(name, None, delay=(t, size))
-        else:
-            self.fields[name] = Field(name, None, array=(t, size))
+            return None
+        return t, size
 
     def _param(self, stmt: ast.AnnAssign, name: str, t: str, p: Param) -> None:
         values = (p.default, p.lo, p.hi)
@@ -1466,6 +1545,7 @@ class _Program:
         self.free_signatures: dict[str, Signature] = {}
         self.lower_free: Callable[[str, Signature], None] = lambda name, signature: None
         self.table_types: dict[str, str | None] = {}
+        self.const_arrays: dict[str, tuple[str, list[str]]] = {}  # tuple name -> (C type, literals)
         self.models: dict[str, _KernelModel] = {}
         self.exported: str | None = None
         self.math_symbols: set[str] = set()
@@ -1489,6 +1569,28 @@ class _Program:
         if signature.failed:
             raise _Abort
         return signature
+
+    def const_tuple(self, name: str) -> tuple[str, tuple[Number, ...]] | None:
+        """A module-level tuple of numbers or of bools: (element type, values). `i32` if every number is an int."""
+        value = getattr(self.module, name, None)
+        if not isinstance(value, tuple) or not value:
+            return None
+        if all(isinstance(v, bool) for v in value):
+            return "bool", value
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in value):
+            return None
+        return ("i32" if all(isinstance(v, int) for v in value) else "f32"), value
+
+    def const_literals(self, name: str, t: str, values: tuple[Number, ...], node: ast.AST) -> None:
+        """Render a tuple's elements once, reporting an element outside `t` at the first runtime index."""
+        if name not in self.const_arrays:
+            self.const_arrays[name] = (self.target.ctype(t), [_literal(v, t, self.target, self.errors, node)
+                                                               for v in values])  # fmt: skip
+
+    def const_code(self, name: str) -> str:
+        ctype, values = self.const_arrays[name]
+        rows = ",\n".join("    " + ", ".join(values[k : k + 8]) for k in range(0, len(values), 8))
+        return f"static const {ctype} cignal_const_{name}[{len(values)}] = {{\n{rows}\n}};"
 
     def table_type(self, name: str) -> str:
         """Check a `@table` function and return its element type. Reports problems once per table."""
@@ -1568,9 +1670,9 @@ static inline {ctype} cignal_lookup_{name}({ctype} x) {{
         held = set()
         for name, node in self.classes.items():
             for stmt in node.body:
-                if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.annotation, ast.Name):
-                    if stmt.annotation.id in self.classes and stmt.annotation.id != name:
-                        held.add(stmt.annotation.id)
+                if isinstance(stmt, ast.AnnAssign):  # `sub: K` or `subs: Array[K, N]`
+                    names = {n.id for n in ast.walk(stmt.annotation) if isinstance(n, ast.Name)}
+                    held |= (names & set(self.classes)) - {name}
         return held
 
     def ordered(self, root: str) -> list[_KernelModel]:
@@ -1784,7 +1886,12 @@ void {cname}_set_param({cname} *self, int index, {sample} value);
         used = set(program.helpers).union(*(self.helpers[k] for k in self.reachable if k in self.helpers))
         used |= {dep for h in used for dep in _HELPER_DEPS.get(h, [])}
         ordered_helpers = sorted(used, key=lambda h: (h not in {d for v in _HELPER_DEPS.values() for d in v}, h))
-        codes = [program.table_code(h[6:]) if h.startswith("table_") else _HELPERS[h] for h in ordered_helpers]
+        codes = [
+            program.table_code(h[6:]) if h.startswith("table_")
+            else program.const_code(h[6:]) if h.startswith("const_")
+            else _HELPERS[h]
+            for h in ordered_helpers
+        ]  # fmt: skip
         helpers = ["\n\n".join(codes)] if codes else []
         for h in used:
             program.math_symbols |= _HELPER_SYMBOLS.get(h, set())
@@ -1833,9 +1940,9 @@ void {cname}_set_param({cname} *self, int index, {sample} value);
                 init += [f"    self->cignal_target_{p.name} = self->{c_name(p.name)};",
                          f"    self->cignal_coef_{p.name} = ({ctype})(1.0 - exp(-1.0 / ({p.smooth!r} * "
                          "(double)sample_rate)));"]  # fmt: skip
-        init += [f"    {self._cname(f)}_init(&self->{c_name(f.name)}, sample_rate);" for f in subs]
+        init += [self._each(f, f"{self._cname(f)}_init(&self->{c_name(f.name)}{{k}}, sample_rate);") for f in subs]
         reset = self._state(model, keep_params=model.exported)
-        reset += [f"    {self._cname(f)}_reset(&self->{c_name(f.name)});" for f in subs]
+        reset += [self._each(f, f"{self._cname(f)}_reset(&self->{c_name(f.name)}{{k}});") for f in subs]
         self.functions.append((None, [f"{storage}void {model.cname}_init({model.cname} *self, {sample} sample_rate) {{",
                                       *init, *body, "}", ""]))  # fmt: skip
         self.functions.append((None, [f"{storage}void {model.cname}_reset({model.cname} *self) {{",
@@ -1856,6 +1963,13 @@ void {cname}_set_param({cname} *self, int index, {sample} value);
         self.helpers[("", name)] = lowerer.helpers
         self.functions.append((("", name), [sig + " {", *body, "}", ""]))
 
+    @staticmethod
+    def _each(f: Field, statement: str) -> str:
+        """`statement` for a sub-kernel field, looped over the elements of an `Array` of them."""
+        if f.count:
+            return f"    for (int32_t k = 0; k < {f.count}; k++) " + statement.format(k="[k]")
+        return "    " + statement.format(k="")
+
     def _cname(self, f: Field) -> str:
         assert f.kernel is not None
         return self.program.model(f.kernel).cname
@@ -1863,11 +1977,12 @@ void {cname}_set_param({cname} *self, int index, {sample} value);
     def _member_decl(self, f: Field) -> str:
         target = self.program.target
         if f.kernel is not None:
-            return f"    {self._cname(f)} {c_name(f.name)};"
+            return f"    {self._cname(f)} {c_name(f.name)}{f.c_suffix};"
         if f.array is not None:
             return f"    {target.ctype(f.array[0])} {c_name(f.name)}[{f.array[1]}];"
         if f.delay is not None:
-            return f"    struct {{ {target.ctype(f.delay[0])} buf[{f.delay[1]}]; int32_t pos; }} {c_name(f.name)};"
+            ctype, size = target.ctype(f.delay[0]), f.delay[1]
+            return f"    struct {{ {ctype} buf[{size}]; int32_t pos; }} {c_name(f.name)}{f.c_suffix};"
         member = f"    {target.ctype(f.type or '')} {c_name(f.name)};"
         if f.smooth > 0 and self.program.model(self.program.exported or "").fields.get(f.name) is f:
             ctype = target.ctype(f.type or "")
@@ -1886,7 +2001,11 @@ void {cname}_set_param({cname} *self, int index, {sample} value);
             elif f.delay is not None:
                 ctype = target.ctype(f.delay[0])
                 self.program.helpers.add(f"delay_clear_{ctype}")
-                lines.append(f"    cignal_delay_clear_{ctype}({name}.buf, {f.delay[1]}, &{name}.pos);")
+                if f.count:
+                    clear = f"cignal_delay_clear_{ctype}({name}[k].buf, {f.delay[1]}, &{name}[k].pos);"
+                    lines.append(f"    for (int32_t k = 0; k < {f.count}; k++) {clear}")
+                else:
+                    lines.append(f"    cignal_delay_clear_{ctype}({name}.buf, {f.delay[1]}, &{name}.pos);")
             elif f.is_scalar and f.name != "sample_rate" and not (keep_params and f.param is not None):
                 lines.append(f"    {name} = {self._literal(f.default, f.type or '')};")
         return lines
