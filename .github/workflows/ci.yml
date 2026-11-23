@@ -29,6 +29,15 @@ jobs:
       - name: Set up Python
         run: uv python install 3.13
 
+      - name: Install Pd and SuperCollider
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends puredata-core supercollider-server supercollider-language
+
+      # The host tests skip when a host is missing; fail here instead. Headers come from thirdparty/.
+      - name: Check hosts
+        run: for host in pd scsynth sclang; do command -v "$host" || exit 1; done
+
       - name: Install dependencies
         run: uv sync --dev
 
@@ -42,7 +51,13 @@ jobs:
         run: uv run mypy
 
       - name: Run tests
-        run: uv run pytest tests/ -v --cov=src/cignal --cov-report=xml
+        run: uv run pytest tests/ -v -rs --cov=src/cignal --cov-report=xml
+        env:  # Ubuntu's sclang is the Qt build; these let it start without a display
+          QT_QPA_PLATFORM: offscreen
+          QTWEBENGINE_DISABLE_SANDBOX: "1"
+          QT_QUICK_BACKEND: software
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          QTWEBENGINE_CHROMIUM_FLAGS: --no-sandbox --disable-gpu
 
   build:
     name: Build (${{ matrix.os }}/${{ matrix.python-version }})

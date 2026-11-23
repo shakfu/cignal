@@ -109,6 +109,12 @@ CASES = [
         HEADER + "def f(a: f32) -> f32:\n    return self.g\n" + FREE_CALLER,
         5,
     ),
+    (RuleId.UNSUPPORTED_CALL, kernel(tick="return min(x)"), 6),
+    (RuleId.UNSUPPORTED_CALL, kernel(tick="return abs(x, x)"), 6),
+    (RuleId.TYPE_MISMATCH, kernel(tick="return x if min(x > 0.0, x < 1.0) else x"), 6),
+    (RuleId.MIXED_NUMERIC, kernel("n: i32 = 0", tick="return max(x, self.n)"), 7),
+    # A module that rebinds a built-in's name gets no built-in.
+    (RuleId.UNSUPPORTED_CALL, HEADER + "abs = math.fabs\n" + FREE_CALLER.replace("f(x)", "abs(x)"), 7),
 ]
 
 # Warnings do not stop the build; they are returned with the generated code.

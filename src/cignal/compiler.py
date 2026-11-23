@@ -34,7 +34,9 @@ NONE = "none"  # the type of a call to a method that returns None
 _MATH_FUNCTIONS = {
     "sin": 1, "cos": 1, "tan": 1, "tanh": 1, "exp": 1, "log": 1,
     "sqrt": 1, "fabs": 1, "floor": 1, "ceil": 1, "atan2": 2, "pow": 2,
+    "fmod": 2, "log2": 1, "log10": 1, "copysign": 2,
 }  # fmt: skip
+_BUILTINS = ("abs", "min", "max")
 _MATH_CONSTANTS = {"pi": math.pi, "tau": math.tau, "e": math.e}
 _CASTS = {"f32": float, "f64": float, "i32": int}
 _LIFECYCLE = ("init", "control", "tick")
@@ -77,7 +79,7 @@ _RESERVED = frozenset(
     "auto break case char const continue default do double else enum extern float for goto if inline int "
     "long register restrict return short signed sizeof static struct switch typedef union unsigned void "
     "volatile while _Bool _Complex _Imaginary bool true false".split()
-) | frozenset(name + suffix for name in (*_MATH_FUNCTIONS, "fmod", "copysign") for suffix in ("", "f"))
+) | frozenset(name + suffix for name in _MATH_FUNCTIONS for suffix in ("", "f"))
 
 # Python's `%`: the result takes the sign of the divisor. The float version follows CPython's float_rem.
 _HELPERS = {
@@ -225,6 +227,17 @@ def _delay_helpers(t: str) -> dict[str, str]:
 
 for _t in ("float", "double"):
     _HELPERS.update(_delay_helpers(_t))
+# CPython's min and max keep the running result unless a later argument compares strictly less (greater).
+# That fixes the NaN and signed-zero cases, where fmin and fmax differ: min(nan, 1.0) is nan, min(0.0, -0.0) is 0.0.
+for _t in ("float", "double", "int32_t"):
+    for _name, _op in (("min", "<"), ("max", ">")):
+        _HELPERS[f"{_name}_{_t}"] = f"""static inline {_t} cignal_{_name}_{_t}({_t} a, {_t} b) {{
+    return b {_op} a ? b : a;
+}}"""
+# C's abs(INT32_MIN) is undefined; this wraps, as the spec promises for i32.
+_HELPERS["abs_int32_t"] = """static inline int32_t cignal_abs_int32_t(int32_t a) {
+    return a < 0 ? (int32_t)(0u - (uint32_t)a) : a;
+}"""
 # Helpers a helper calls, emitted before it.
 _HELPER_DEPS = {"delay_read_frac_float": ["delay_read_float"], "delay_read_frac_double": ["delay_read_double"]}
 _HELPER_SYMBOLS = {
@@ -1024,6 +1037,8 @@ class _FunctionLowerer:
             return self._table_call(func.id, node)
         if isinstance(func, ast.Name) and func.id in self.program.free_nodes:
             return self._free_call(func.id, node)
+        if isinstance(func, ast.Name) and func.id in _BUILTINS and self._is_builtin(func.id):
+            return self._builtin(func.id, node)
         if isinstance(func, ast.Attribute):
             if self.kernel.is_module(func.value, math) and func.attr in _MATH_FUNCTIONS:
                 return self._math(func.attr, node)
@@ -1035,7 +1050,7 @@ class _FunctionLowerer:
             if receiver is not None:
                 return self._method_call(receiver, func.attr, node)
         self.errors.add(RuleId.UNSUPPORTED_CALL, f"call to `{ast.unparse(func)}`", node,
-                        "supported: f32()/f64()/i32(), math." + "/".join(_MATH_FUNCTIONS) +
+                        "supported: f32()/f64()/i32(), abs()/min()/max(), math." + "/".join(_MATH_FUNCTIONS) +
                         ", and methods of this kernel or its sub-kernels")  # fmt: skip
         raise _Abort
 
@@ -1113,6 +1128,39 @@ class _FunctionLowerer:
             return operand
         cast = f"({self.target.ctype(t)}){_wrap(operand, operand.code, _PREC_UNARY, right=True)}"
         return _Expr(cast, t, prec=_PREC_UNARY)
+
+    def _is_builtin(self, name: str) -> bool:
+        """`name` is Python's built-in: the kernel's module does not rebind it."""
+        return getattr(self.kernel.module, name, getattr(builtins, name)) is getattr(builtins, name)
+
+    def _builtin(self, name: str, node: ast.Call) -> _Expr:
+        """`abs`, and `min`/`max` of two or more arguments, folded left as CPython evaluates them."""
+        if (name == "abs") != (len(node.args) == 1) or not node.args:
+            arity = "one argument" if name == "abs" else "two or more arguments"
+            self.errors.add(RuleId.UNSUPPORTED_CALL, f"{name}() takes {arity}", node)
+            raise _Abort
+        args = [self._expr(arg) for arg in node.args]
+        t = self._unify(*args, node=node)
+        if t not in (None, "i32", *FLOAT_TYPES) or any(isinstance(a.value, bool) for a in args):
+            self.errors.add(RuleId.TYPE_MISMATCH, f"{name}() of {_type_text(t or 'bool')}", node)
+            raise _Abort
+        if t is None:
+            return _Expr("", None, getattr(builtins, name)(*(a.value for a in args)))
+        assert isinstance(t, str)
+        ctype = self.target.ctype(t)
+        if name == "abs" and t == "i32":
+            self.helpers.add("abs_int32_t")
+            return _Expr(f"cignal_abs_int32_t({self._coerce(args[0], t, node)})", t)
+        if name == "abs":
+            symbol = "fabsf" if ctype == "float" else "fabs"
+            self.program.math_symbols.add(symbol)
+            return _Expr(f"{symbol}({self._coerce(args[0], t, node)})", t)
+        helper = f"{name}_{ctype}"
+        self.helpers.add(helper)
+        code = self._coerce(args[0], t, node)
+        for arg in args[1:]:
+            code = f"cignal_{helper}({code}, {self._coerce(arg, t, node)})"
+        return _Expr(code, t)
 
     def _math(self, name: str, node: ast.Call) -> _Expr:
         if len(node.args) != _MATH_FUNCTIONS[name]:

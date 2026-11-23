@@ -10,6 +10,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 - `thirdparty/` holds the same headers for the tests, which fall back to it. It is in neither the wheel nor the sdist.
 
+- Built-ins `abs`, `min` and `max`, and `math.fmod`, `math.log2`, `math.log10` and `math.copysign`. `min` and `max` compile to `b < a ? b : a` helpers, not `fmin`/`fmax`, which differ from CPython on NaN and signed zeros: `min(nan, 1.0)` is `nan` and `min(0.0, -0.0)` is `0.0`. `abs` on `i32` wraps at `INT32_MIN`.
+
+- CI installs Pd and SuperCollider, so the host tests run on Ubuntu x86-64 (GCC, Pd 0.56, SuperCollider 3.13). A missing host fails the job, where the tests would skip.
+
 ### Fixed
 
 - `scsynth` and Pd are found in app bundles up to two folders below `/Applications`, such as `/Applications/Studio/supercollider-3.14.1/`.

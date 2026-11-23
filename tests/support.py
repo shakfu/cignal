@@ -61,6 +61,7 @@ CASES = [
     # No reset: the only state is the smoothed parameter, and reset keeps parameters.
     Case("drive.py", "Drive", ((1000, "drive", 3.0), (2500, "drive", 0.5), (3600, "drive", 10.0))),
     Case("ops.py", "Ops"),
+    Case("builtins.py", "Builtins"),
     Case("glide.py", "Glide", ((0, "level", 440.0), (2000, "level", 0.0))),
     Case("wavetable.py", "Wavetable", ((1700, "freq", 1234.5), (3100, "reset", 0.0), (3900, "freq", 99.0))),
 ]

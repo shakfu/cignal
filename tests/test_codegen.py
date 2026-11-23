@@ -141,3 +141,23 @@ def test_without_prefix_the_shared_sub_kernel_collides(tmp_path: Path) -> None:
     built = _two_kernels_in_one_program(tmp_path, ("", ""))
     assert built.returncode != 0
     assert "duplicate symbol" in built.stderr or "multiple definition" in built.stderr  # Apple ld, GNU ld
+
+
+def test_builtin_min_yields_to_a_module_function_and_folds_constants(tmp_path: Path) -> None:
+    path = tmp_path / "k.py"
+    path.write_text(
+        textwrap.dedent("""
+        from cignal import Kernel, f32
+
+        def min(a: f32, b: f32) -> f32:
+            return a
+
+        class K(Kernel):
+            def tick(self, x: f32) -> f32:
+                return min(x, 2.0) + max(1.0, 3.0, 2.0) * abs(-x)
+    """)
+    )
+    c = compile_kernel(path).source
+    assert "cignal_fn_min(x, 2.0f)" in c
+    assert "3.0f * fabsf(-x)" in c
+    assert "cignal_min_" not in c and "cignal_max_" not in c

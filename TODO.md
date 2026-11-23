@@ -8,11 +8,11 @@ Design questions are argued in [`docs/dev/spec.md`](docs/dev/spec.md) section 13
 
 ### Before v1.0
 
-- [ ] **Built-ins:** `abs`, `min`, `max`, `math.fmod`, `math.log2`, `math.log10`, `math.copysign` (spec 5.2, marked planned).
+- [x] **Built-ins:** `abs`, `min`, `max`, `math.fmod`, `math.log2`, `math.log10`, `math.copysign` (spec 5.2).
 
-- [ ] **CI workflow.** Linux tests run only locally, in Apple `container` VMs (`make test-linux`, `ARCH=amd64`).
+- [x] **CI workflow.** GitHub Actions on Ubuntu x86-64, with Pd and SuperCollider, so the host tests run on every push.
 
-- [ ] **PyPI release.** The name `cignal` was free on 2026-11-22.
+- [x] **PyPI release.** 0.0.1, 2026-11-22.
 
 ## Medium
 
@@ -25,6 +25,8 @@ Design questions are argued in [`docs/dev/spec.md`](docs/dev/spec.md) section 13
 ### Before v1.0
 
 - [ ] **Multi-channel instances for SIMD** (spec 7, 13.6). Changes the kernel ABI, so decide before v1.0 freezes it.
+
+- [ ] **macOS CI job.** CI covers GCC and glibc only; clang and Apple's libm are checked only on a developer machine.
 
 ## Low
 

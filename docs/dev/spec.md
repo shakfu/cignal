@@ -202,12 +202,13 @@ Anything else is rejected with a diagnostic that names the construct.
 | `%` on floats | `fmodf`, then adjusted as CPython's `float_rem` does | The result takes the divisor's sign, including for zero. Bit-identical to CPython. |
 | `x ** y` on floats | `powf` / `pow`, even for a constant integer `y` | CPython computes float `**` with libm `pow`; `x * x * x` would round differently |
 | `a ** k` on `i32` | exponentiation by squaring, wrapping | `k` must be a non-negative constant: for negative `k` Python returns a float |
-| `math.sin cos tan tanh exp log sqrt fabs floor ceil atan2 pow` | `f`-suffixed `<math.h>` functions | `double` variants for `f64` |
+| `math.sin cos tan tanh exp log log2 log10 sqrt fabs floor ceil atan2 pow fmod copysign` | `f`-suffixed `<math.h>` functions | `double` variants for `f64`. CPython calls the same libm functions. |
 | `math.pi`, `math.tau`, `math.e` | literals | |
 | `& \| ^ ~` on `i32` | same | Equal on two's complement. Non-atom operands are parenthesised (GCC `-Wparentheses`). |
 | `<<`, `>>` on `i32` | helpers | `<<` shifts through `uint32_t`. `>>` floors, as Python does, without shifting a negative value. Counts outside 0..31, where Python's result leaves `i32` or raises, give the limiting value. |
 | `and or not`, comparisons | same | `a < b < c` becomes `a < b && b < c`, with Python's short-circuit order. Middle operands are evaluated twice, so they may not contain calls. |
-| `abs`, `min`, `max`, `math.fmod`, `log2`, `log10`, `copysign` | | Planned; not implemented |
+| `abs(x)` | `fabsf` / `fabs`; a wrapping helper on `i32` | `abs(INT32_MIN)` wraps to `INT32_MIN`, where C's `abs` is undefined |
+| `min(a, b, ...)`, `max(a, b, ...)` | helpers, nested left to right: `b < a ? b : a` | CPython keeps the first argument unless a later one is strictly less (greater). `fmin`/`fmax` differ on NaN and signed zeros: `min(nan, 1.0)` is `nan`, `min(0.0, -0.0)` is `0.0`. Only when the module does not rebind the name. |
 | `f32(x)`, `f64(x)`, `i32(x)` | casts | `i32(x)` truncates towards zero in both languages |
 
 - Numeric literals take the type their context needs: `0.5` in an `f32` expression is emitted as `0.5f`.
@@ -344,6 +345,8 @@ M0 calibration:
 - Parameter values in tests are rounded to `float32`, like the signals, so both builds see the same parameter. The rounding of a decimal like 0.0333 is an input difference, not arithmetic error.
 
 M2 calibration: the lowest `float` SNRs are the biquad (106 dB), the resonant lowpass (107 dB) and the state-variable filter (115 dB). The echo reached 152 dB once its delay position was `f64`.
+
+Contraction can also change a non-finite result, not just the last bit. In the `float` build, clang fused `a * b - a * b`, whose product overflows, into `fma(a, b, -inf)`. That gives `-inf` where CPython gives NaN. The `builtins` fixture computes `inf` and `inf - inf` in separate statements, because C never contracts across statements. A kernel that relies on an exact `inf - inf` must do the same, or build with `-ffp-contract=off`.
 
 Known failures are strict xfails with a reason, as in multigen's `KNOWN_FAILURES`. A fix fails the run until its entry is deleted.
 
