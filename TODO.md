@@ -35,4 +35,3 @@ Design questions are argued in [`docs/dev/spec.md`](docs/dev/spec.md) section 13
 - [ ] **Fixed-point output** (spec 13.5): Vult's q16.16, for Teensy and Eurorack. Only if hardware targets become near-term.
 
 - [ ] **More hosts:** candidates are CLAP and Max. Each needs a shim in `src/cignal/shims/` and a bit-exact host test, as Pd and SuperCollider have.
-

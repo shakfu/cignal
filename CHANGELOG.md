@@ -4,6 +4,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ## [Unreleased]
 
+## [0.0.2]
+
 ### Added
 
 - `cignal fetch-headers [pd] [sc]` downloads `m_pd.h` (Pd 0.57.0) and the SuperCollider 3.14.1 plugin headers into the user cache. Each file is pinned by commit and SHA-256, and a failed fetch installs nothing. The build uses the cache after `$PD_INCLUDE`/`$SC_INCLUDE` and installed copies. The headers are downloaded, not shipped, so the package stays MIT: the SuperCollider headers are GPL-2.0-or-later. The macOS SuperCollider app has no plugin headers, so before this an SC build there needed a source checkout.
