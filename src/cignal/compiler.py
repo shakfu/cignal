@@ -20,7 +20,7 @@ from types import ModuleType
 from typing import NoReturn
 
 from .diagnostics import CompileError, Diagnostic, DiagnosticSeverity, RuleId, SourceSpan
-from .kernel import SMOOTH_SNAP, Array, Delay, Kernel, Param, Spec, Table
+from .kernel import SMOOTH_SNAP, Array, Delay, Kernel, Param, Spec, Table, event
 
 Number = bool | int | float
 Ty = str | tuple[str, ...]  # a scalar type name, or a tuple of scalar type names
@@ -40,7 +40,9 @@ _BUILTINS = ("abs", "min", "max")
 _MATH_CONSTANTS = {"pi": math.pi, "tau": math.tau, "e": math.e}
 _CASTS = {"f32": float, "f64": float, "i32": int}
 _LIFECYCLE = ("init", "control", "tick")
-_RESERVED_METHODS = ("process", "set_param", "reset", "target")
+_RESERVED_METHODS = ("process", "set_param", "reset", "target", "event")
+# Event names the Pd shim cannot take: Pd's built-in selectors and the shim's own methods.
+_RESERVED_EVENTS = frozenset({"anything", "bang", "dsp", "float", "list", "pointer", "reset", "signal", "symbol"})
 
 
 def _py_mod(a: Number, b: Number) -> Number:
@@ -240,6 +242,13 @@ _HELPERS["abs_int32_t"] = """static inline int32_t cignal_abs_int32_t(int32_t a)
 }"""
 # GCC -O2 does not unroll a loop over sub-kernels, which serialises their dependency chains: 3.9x slower on
 # an 8-biquad bank (docs/dev/simd.md). clang unrolls these already, and forcing it slowed the ladders by 12%.
+# kernel.event_i32: C's float-to-int conversion is undefined for NaN and out-of-range values.
+_HELPERS["event_i32"] = """static inline int32_t cignal_event_i32(double v) {
+    if (isnan(v)) return 0;
+    if (v <= -2147483648.0) return INT32_MIN;
+    if (v >= 2147483647.0) return INT32_MAX;
+    return (int32_t)v;
+}"""
 _HELPERS["unroll"] = """#ifndef CIGNAL_UNROLL
 #if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 8
 #define CIGNAL_PRAGMA(x) _Pragma(#x)
@@ -314,6 +323,7 @@ class Signature:
     returns: Ty | None
     node: ast.FunctionDef
     failed: bool = False
+    event: bool = False  # `@event def on_<name>`: on the exported kernel, a function hosts call
 
 
 @dataclass
@@ -330,6 +340,7 @@ class CKernel:
     sample_ctype: str
     math_symbols: frozenset[str]
     c_name: str = ""  # the C identifier of the kernel: `--prefix` plus its name
+    events: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)  # (host name, argument types)
     warnings: list[Diagnostic] = field(default_factory=list)
 
 
@@ -1531,8 +1542,8 @@ class _KernelModel:
     def _param(self, stmt: ast.AnnAssign, name: str, t: str, p: Param, size: int = 0) -> None:
         """A scalar parameter, or an `Array` of `size` parameters sharing one range, default and smoothing."""
         values = (p.default, p.lo, p.hi)
-        if t != "f32":
-            self.errors.add(RuleId.BAD_PARAM, f"parameter `{name}` must be f32, not {t}", stmt)
+        if t not in FLOAT_TYPES:
+            self.errors.add(RuleId.BAD_PARAM, f"parameter `{name}` must be f32 or f64, not {t}", stmt)
         elif not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in values):
             self.errors.add(RuleId.BAD_PARAM, f"parameter `{name}` needs finite numeric default, lo and hi", stmt)
         elif not p.lo <= p.default <= p.hi:
@@ -1556,8 +1567,10 @@ def _signature(model: _KernelModel, method: ast.FunctionDef, free: bool = False)
     name = method.name
     if args.vararg or args.kwarg or args.kwonlyargs or args.posonlyargs or args.defaults:
         errors.add(RuleId.BAD_SIGNATURE, f"`{name}` may take only plain positional parameters", method)
-    if method.decorator_list:
-        errors.add(RuleId.UNSUPPORTED_SYNTAX, "decorated methods", method.decorator_list[0])
+    marked = [d for d in method.decorator_list if not free and _is_event_decorator(model, d)]
+    for d in method.decorator_list:
+        if d not in marked:
+            errors.add(RuleId.UNSUPPORTED_SYNTAX, "decorated methods, other than `@event`", d)
     if not free and (not args.args or args.args[0].arg != "self"):
         errors.add(RuleId.BAD_SIGNATURE, f"`{name}` must take `self` first", method)
         raise _Abort
@@ -1571,6 +1584,18 @@ def _signature(model: _KernelModel, method: ast.FunctionDef, free: bool = False)
             raise _Abort
         params[arg.arg] = t
     returns = model.resolve_returns(method.returns)
+    if marked or name.startswith("on_"):
+        if not marked:
+            errors.add(RuleId.BAD_SIGNATURE, f"`{name}` is named as an event: mark it `@event`", method,
+                       "or rename it without the `on_` prefix")  # fmt: skip
+        elif not name.startswith("on_") or name == "on_":
+            errors.add(RuleId.BAD_SIGNATURE, f"event method `{name}` must be named `on_<event>`", method)
+        elif name[3:] in _RESERVED_EVENTS:
+            errors.add(RuleId.BAD_SIGNATURE, f"event `{name[3:]}` is reserved by a host", method,
+                       f"reserved: {', '.join(sorted(_RESERVED_EVENTS))}")  # fmt: skip
+        if returns is not None:
+            errors.add(RuleId.BAD_SIGNATURE, f"event `{name}` must return None", method)
+        return Signature(params, returns, method, event=bool(marked))
     if free:
         if returns is not None and (not method.body or not isinstance(method.body[-1], ast.Return)):
             errors.add(RuleId.BAD_SIGNATURE, f"`{name}` must end with a `return`", method)
@@ -1586,6 +1611,13 @@ def _signature(model: _KernelModel, method: ast.FunctionDef, free: bool = False)
     elif returns is not None and (not method.body or not isinstance(method.body[-1], ast.Return)):
         errors.add(RuleId.BAD_SIGNATURE, f"`{name}` must end with a `return`", method)
     return Signature(params, returns, method)
+
+
+def _is_event_decorator(model: _KernelModel, node: ast.expr) -> bool:
+    """`@event` or `@cignal.event`, resolved in the kernel module."""
+    if isinstance(node, ast.Name):
+        return getattr(model.module, node.id, None) is event
+    return isinstance(node, ast.Attribute) and node.attr == "event" and model.is_cignal_alias("event", node)
 
 
 class _Program:
@@ -1888,7 +1920,9 @@ class _Generator:
         for model in models:
             self._kernel_functions(model)
         program.check_recursion()
-        self.reachable = self._reachable({(name, "tick"), (name, "control"), *((m.name, "init") for m in models)})
+        events = [(m[3:], s) for m, s in root.signatures.items() if s.event]
+        roots = {(name, "tick"), (name, "control"), *((m.name, "init") for m in models)}
+        self.reachable = self._reachable(roots | {(name, f"on_{e}") for e, _ in events})
         for caller in sorted(self._reachable({(name, "control")})):
             for node in self.smoothed_reads.get(caller, []):
                 program.errors.add(RuleId.BAD_PARAM, f"`{ast.unparse(node)}` is smoothed per sample, so `control` "
@@ -1905,6 +1939,12 @@ class _Generator:
         setters = "".join(
             f"void {cname}_set_{p.name}({cname} *self, {'int element, ' if p.array else ''}{sample} value);\n"
             for p in params
+        )
+        event_decls = "".join(
+            f"void {cname}_on_{e}({cname} *self"
+            + "".join(f", {target.ctype(t)} {c_name(a)}" for a, t in s.params.items())
+            + ");\n"
+            for e, s in events
         )
         process_sig = f"void {cname}_process({cname} *self, const {sample} *const *in, {sample} *const *out, int n)"
         init_sig = f"void {cname}_init({cname} *self, {sample} sample_rate)"
@@ -1924,16 +1964,20 @@ extern "C" {{
 #ifndef CIGNAL_INFO_TYPES
 #define CIGNAL_INFO_TYPES
 typedef struct {{ const char *name; double lo, hi, def; }} cignal_param_info;
+typedef struct {{ const char *name; int n_args; }} cignal_event_info;
 typedef struct {{
     const char *name;
     int n_inputs, n_outputs, n_params;
     const cignal_param_info *params;
     size_t size;
+    int n_events;
+    const cignal_event_info *events;
 }} cignal_kernel_info;
 #endif
 
 {chr(10).join(structs)}
-enum {{ {cname}_N_INPUTS = {n_inputs}, {cname}_N_OUTPUTS = {len(outputs)}, {cname}_N_PARAMS = {len(slots)} }};
+enum {{ {cname}_N_INPUTS = {n_inputs}, {cname}_N_OUTPUTS = {len(outputs)}, {cname}_N_PARAMS = {len(slots)},
+       {cname}_N_EVENTS = {len(events)} }};
 
 extern const cignal_kernel_info {cname}_info;
 
@@ -1941,7 +1985,8 @@ extern const cignal_kernel_info {cname}_info;
 void {cname}_reset({cname} *self);
 {process_sig};
 void {cname}_set_param({cname} *self, int index, {sample} value);
-{setters}
+{setters}void {cname}_event({cname} *self, int index, const {sample} *args);
+{event_decls}
 #ifdef __cplusplus
 }}
 #endif
@@ -1952,6 +1997,8 @@ void {cname}_set_param({cname} *self, int index, {sample} value);
             f"typedef struct {{ {' '.join(f'{target.ctype(e)} v{i};' for i, e in enumerate(t))} }} {target.ctype(t)};"
             for t in sorted(program.tuples | ({outputs} if len(outputs) > 1 else set()))
         ]
+        if any(t == "i32" for _, s in events for t in s.params.values()):
+            program.helpers.add("event_i32")
         used = set(program.helpers).union(*(self.helpers[k] for k in self.reachable if k in self.helpers))
         used |= {dep for h in used for dep in _HELPER_DEPS.get(h, [])}
         ordered_helpers = sorted(used, key=lambda h: (h not in {d for v in _HELPER_DEPS.values() for d in v}, h))
@@ -1973,11 +2020,12 @@ void {cname}_set_param({cname} *self, int index, {sample} value);
         for key, lines in self.functions:
             if key is None or key in self.reachable:
                 source += lines
-        source += self._public(root, n_inputs, outputs, init_sig, process_sig)
+        source += self._public(root, n_inputs, outputs, init_sig, process_sig, events)
         info = [(n, *(p.param or (0.0, 0.0)), float(p.default)) for n, p, _ in slots]
         return CKernel(name, name_h(self.path), header, "\n".join(source), n_inputs, len(outputs),
                        [(n, lo, hi, d) for n, lo, hi, d in info], sample,
-                       frozenset(program.math_symbols), c_name=root.cname)  # fmt: skip
+                       frozenset(program.math_symbols), c_name=root.cname,
+                       events=[(e, tuple(s.params.values())) for e, s in events])  # fmt: skip
 
     def _kernel_functions(self, model: _KernelModel) -> None:
         target = self.program.target
@@ -1989,7 +2037,8 @@ void {cname}_set_param({cname} *self, int index, {sample} value);
             if isinstance(signature.returns, tuple):
                 self.program.tuples.add(signature.returns)
             fname = f"{model.cname}_{method}_body" if method == "init" else f"{model.cname}_{method}"
-            sig = f"static inline {returns} {fname}({model.cname} *self{args})"
+            storage = "" if signature.event and model.exported else "static inline "
+            sig = f"{storage}{returns} {fname}({model.cname} *self{args})"
             self.defined[(model.name, method)] = (len(self.defined), sig)
             self.helpers[(model.name, method)] = lowerer.helpers
             self.smoothed_reads[(model.name, method)] = lowerer.smoothed_reads
@@ -2005,7 +2054,7 @@ void {cname}_set_param({cname} *self, int index, {sample} value);
         for p in model.params:
             if p.smooth > 0:
                 self.program.math_symbols.add("exp")
-                ctype = target.ctype("f32")
+                ctype = target.ctype(p.array[0] if p.array else p.type or "")
                 loop, k = (f"for (int32_t k = 0; k < {p.array[1]}; k++) ", "[k]") if p.array else ("", "")
                 init += [f"    {loop}self->cignal_target_{p.name}{k} = self->{c_name(p.name)}{k};",
                          f"    self->cignal_coef_{p.name} = ({ctype})(1.0 - exp(-1.0 / ({p.smooth!r} * "
@@ -2103,7 +2152,13 @@ void {cname}_set_param({cname} *self, int index, {sample} value);
         return [self.defined[key][1] + ";" for key in sorted(needed, key=lambda k: self.defined[k][0])]
 
     def _public(
-        self, root: _KernelModel, n_inputs: int, outputs: tuple[str, ...], init_sig: str, process_sig: str
+        self,
+        root: _KernelModel,
+        n_inputs: int,
+        outputs: tuple[str, ...],
+        init_sig: str,
+        process_sig: str,
+        events: list[tuple[str, Signature]],
     ) -> list[str]:
         name = root.cname
         sample = self.program.target.ctype("f32")
@@ -2115,9 +2170,10 @@ void {cname}_set_param({cname} *self, int index, {sample} value);
         lines += [f"    {name}_control(self);"] if "control" in root.signatures else []
         args = "".join(f", in{k}" for k in range(n_inputs))
         lines += ["    for (int i = 0; i < n; i++) {"]
-        snap = self._literal(SMOOTH_SNAP, "f32")
         for p in root.params:
             if p.smooth > 0:  # kernel.smooth_step
+                t = p.array[0] if p.array else p.type or ""
+                ctype, snap = self.program.target.ctype(t), self._literal(SMOOTH_SNAP, t)
                 k = "[k]" if p.array else ""
                 v, target, coef = (
                     f"self->{c_name(p.name)}{k}",
@@ -2129,8 +2185,8 @@ void {cname}_set_param({cname} *self, int index, {sample} value);
                 step = [f"if ({v} == {target}) {{",
                         f"    {v} = {target};",
                         "} else {",
-                        f"    const {sample} d = {target} - {v};",
-                        f"    const {sample} stepped = {v} + {coef} * d;",
+                        f"    const {ctype} d = {target} - {v};",
+                        f"    const {ctype} stepped = {v} + {coef} * d;",
                         f"    {v} = stepped == {v} || (d > -{snap} && d < {snap}) ? {target} : stepped;",
                         "}"]  # fmt: skip
                 if p.array:
@@ -2149,8 +2205,10 @@ void {cname}_set_param({cname} *self, int index, {sample} value);
             lines.append("    switch (index) {")
             for index, (_, p, element) in enumerate(slots):
                 assert p.param is not None
-                lo, hi = (self._literal(v, "f32") for v in p.param)
-                clamp = f"value < {lo} ? {lo} : (value > {hi} ? {hi} : value)"
+                t = p.array[0] if p.array else p.type or ""
+                lo, hi = (self._literal(v, t) for v in p.param)
+                v = "value" if t == "f32" else f"({self.program.target.ctype(t)})value"
+                clamp = f"{v} < {lo} ? {lo} : ({v} > {hi} ? {hi} : {v})"
                 dest = f"cignal_target_{p.name}" if p.smooth > 0 else c_name(p.name)
                 dest += "" if element is None else f"[{element}]"
                 lines.append(f"    case {index}: self->{dest} = {clamp}; break;")
@@ -2173,9 +2231,34 @@ void {cname}_set_param({cname} *self, int index, {sample} value);
                                 for n, p, _ in slots if p.param is not None)  # fmt: skip
             lines += [f"static const cignal_param_info {name}_params[] = {{{entries}}};", ""]
             table = f"{name}_params"
-        fields = f'"{root.name}", {n_inputs}, {len(outputs)}, {len(slots)}, {table}, sizeof({name})'
+        lines += [f"void {name}_event({name} *self, int index, const {sample} *args) {{"]
+        if events:
+            lines.append("    switch (index) {")
+            for index, (e, s) in enumerate(events):
+                args = "".join(f", {self._event_arg(t, f'args[{k}]')}" for k, t in enumerate(s.params.values()))
+                lines.append(f"    case {index}: {name}_on_{e}(self{args}); break;")
+            lines += ["    default: break;", "    }"]
+            lines += [] if any(s.params for _, s in events) else ["    (void)args;"]
+        else:
+            lines += ["    (void)self;", "    (void)index;", "    (void)args;"]
+        lines += ["}", ""]
+        event_table = "NULL"
+        if events:
+            entries = ", ".join(f'{{"{e}", {len(s.params)}}}' for e, s in events)
+            lines += [f"static const cignal_event_info {name}_events[] = {{{entries}}};", ""]
+            event_table = f"{name}_events"
+        fields = (f'"{root.name}", {n_inputs}, {len(outputs)}, {len(slots)}, {table}, sizeof({name}), '
+                  f"{len(events)}, {event_table}")  # fmt: skip
         lines += [f"const cignal_kernel_info {name}_info = {{{fields}}};", ""]
         return lines
+
+    def _event_arg(self, t: str, value: str) -> str:
+        """A host's `sample` value as an event argument of type `t` (kernel.Kernel.event)."""
+        if t == "i32":
+            return f"cignal_event_i32((double){value})"
+        if t == "bool":
+            return f"{value} != 0"
+        return value if t == "f32" else f"({self.program.target.ctype(t)}){value}"
 
     def _literal(self, value: Number, t: str) -> str:
         try:

@@ -11,7 +11,7 @@ from cignal.cli import main
 from cignal.compiler import compile_kernel
 from cignal.diagnostics import CompileError, RuleId
 
-HEADER = "import math\nfrom cignal import Array, Delay, Kernel, f32, f64, i32, param, table\n\n"
+HEADER = "import math\nfrom cignal import Array, Delay, Kernel, event, f32, f64, i32, param, table\n\n"
 
 
 def kernel(fields: str = "", tick: str = "return x", tick_sig: str = "(self, x: f32) -> f32") -> str:
@@ -115,6 +115,13 @@ CASES = [
     (RuleId.BAD_PARAM, kernel(ARRAY_PARAM, tick='return self.target("g")'), 7),
     (RuleId.BAD_PARAM, kernel(ARRAY_PARAM + "g_1: f32 = 0.0"), 4),
     (RuleId.BAD_PARAM, kernel(ARRAY_PARAM.replace("f32", "i32")), 5),
+    (RuleId.BAD_PARAM, kernel("g: bool = param(1.0, lo=0.0, hi=2.0)"), 5),
+    (RuleId.BAD_SIGNATURE, kernel("def on_x(self) -> None:\n    pass"), 5),  # an event needs `@event`
+    (RuleId.BAD_SIGNATURE, kernel("@event\ndef x(self) -> None:\n    pass"), 6),  # and the `on_` prefix
+    (RuleId.BAD_SIGNATURE, kernel("@event\ndef on_reset(self) -> None:\n    pass"), 6),
+    (RuleId.BAD_SIGNATURE, kernel("@event\ndef on_x(self) -> f32:\n    return 1.0"), 6),
+    (RuleId.BAD_SIGNATURE, kernel("def event(self) -> None:\n    pass"), 5),
+    (RuleId.UNSUPPORTED_SYNTAX, kernel("@staticmethod\ndef f(self) -> None:\n    pass"), 5),
     (RuleId.UNSUPPORTED_SYNTAX, kernel("n: i32 = 2", tick="return x + f32(self.n ** self.n)"), 7),
     (RuleId.UNSUPPORTED_SYNTAX, kernel("n: i32 = 2", tick="return x + f32(self.n ** -1)"), 7),
     (RuleId.TYPE_MISMATCH, kernel(tick="return f32(i32(x) & 3) + x * 2.0 % 1.0 + f32(x & 1.0)"), 6),

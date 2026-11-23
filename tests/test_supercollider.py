@@ -1,6 +1,6 @@
 """The SuperCollider UGen, rendered by scsynth in non-real-time mode, matches the driver bit for bit.
 
-Each case's parameter changes and resets are moved to the start of their 64-sample block, since
+Each case's parameter changes, resets and events are moved to the start of their 64-sample block, since
 SuperCollider reads parameters once per block, and the driver gets the same moved changes.
 """
 
@@ -46,7 +46,8 @@ def test_sc_ugen_matches_driver(tmp_path: Path, driver: Driver, case: Case) -> N
     params = [(p[0], p[3]) for p in info.params]
     kernel_index = synthdef(ugen, info.n_inputs, info.n_outputs, params)[1]
     events = [
-        (frame, osc_message("/u_cmd", NODE, kernel_index, "reset") if name == "reset"
+        (frame, osc_message("/u_cmd", NODE, kernel_index, name, *value) if isinstance(value, tuple)
+         else osc_message("/u_cmd", NODE, kernel_index, "reset") if name == "reset"
          else osc_message("/n_set", NODE, name, value))
         for frame, name, value in changes
     ]  # fmt: skip
@@ -101,8 +102,9 @@ def test_generated_sc_class_builds_a_working_synthdef(
     x = signals()["noise"]
     if info.n_inputs:
         write_float_wav(tmp_path / "in.wav", inputs(case, x))
-    # Resets need the UGen's index for /u_cmd, which sclang chooses; test_sc_ugen_matches_driver covers them.
-    changes = tuple((f - f % BLOCK, n, v) for f, n, v in case.changes if n != "reset")
+    # Resets and events need the UGen's index for /u_cmd, which sclang chooses; test_sc_ugen_matches_driver
+    # covers them.
+    changes = tuple((f - f % BLOCK, n, v) for f, n, v in case.changes if n != "reset" and not isinstance(v, tuple))
     events = [(frame, osc_message("/n_set", NODE, name, value)) for frame, name, value in changes]
     proc = render(SCSYNTH, plugin.parent, tmp_path, sc_ugen_name(info), info.n_inputs, info.n_outputs, [], events,
                   FRAMES, SAMPLE_RATE, tmp_path / "in.wav" if info.n_inputs else None,

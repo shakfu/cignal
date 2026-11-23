@@ -16,11 +16,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 - `Array` parameters: `cutoffs: Array[f32, 4] = param(1000.0, lo=20.0, hi=20000.0, smooth=0.002)` gives each voice its own value. Hosts see 4 scalar parameters, `cutoffs_0` to `cutoffs_3`, so Pd gets one inlet and SuperCollider one input per element, and neither shim changed. The alternative, an indexed setter in the ABI, needed new routing in every host. `K_set_cutoffs(k, element, v)` takes the element index.
 
+- `f64` parameters. The host still sets a `sample`, which is widened; the value, its target and its glide stay `double` in the float build. The synth fixture's smoothed `f64` pitch measures 115 dB of float SNR, against 98 dB as `f32`, and replaces a hand-written glide. Keeping all smoother state in `double` was the alternative: it changes every smoothed kernel's output and still rounds each read to `f32`.
+
+- Events: a method marked `@event` and named `on_<name>` is a function hosts call between blocks. Pd gets a message `note 60 0.8`, SuperCollider a unit command, and Python `kernel.event("note", 60, 0.8)`. Parameters cannot express notes: re-sending a held gate does nothing, and a note-off and note-on in one block collapse to one value. Events also let the kernel allocate voices (`tests/fixtures/synth.py`). A "changed" query on parameters was the alternative; it fixes only retriggering (`docs/dev/events.md`).
+
+  ```python
+  @event
+  def on_note(self, note: i32, velocity: f32) -> None: ...
+  ```
+
+  Host values convert to `i32` by truncation, saturating, with NaN as 0, since a C cast is undefined there. `event` is a reserved method name, and so are event names Pd uses itself (`bang`, `float`, `reset`, ...).
+
 ### Changed
+
+- The ABI adds `K_event(k, index, args)` and one `K_on_<name>` per event, and `cignal_kernel_info` ends with `n_events` and `events`.
 
 - Under GCC, a `range` loop with constant bounds and 2 to 16 iterations is fully unrolled. GCC `-O2` ran each sub-kernel of an `Array[K, 8]` in turn, so their dependency chains did not overlap: an 8-biquad bank went from 25.4 to 6.5 ns/frame, Freeverb from 13.1 to 11.2. clang already unrolled the bank, and forcing it slowed an 8-voice ladder by 12%, so the macro is empty there (`docs/dev/simd.md`).
 
 - Kernels without inputs run the differential tests on one signal, not five, so the suite reports no skips.
+
+### Fixed
+
+- The sclang class of a kernel with neither inputs nor parameters had `*ar { || ...`, which sclang rejects.
 
 ## [0.0.2]
 

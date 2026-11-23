@@ -17,7 +17,13 @@ FIXTURES = Path(__file__).parent / "fixtures"
 SAMPLE_RATE = 48000
 FRAMES = 4800  # a multiple of Pd's 64-sample block
 
-Change = tuple[int, str, float]  # (frame, parameter, value); the parameter "reset" resets the kernel
+# (frame, parameter, value). The parameter "reset" resets the kernel. A tuple value makes it an event:
+# (frame, "note", (60.0, 0.8)) calls `on_note`.
+Change = tuple[int, str, float | tuple[float, ...]]
+
+
+def _f32(value: float | tuple[float, ...]) -> float | tuple[float, ...]:
+    return tuple(map(_f32, value)) if isinstance(value, tuple) else float(np.float32(value))  # type: ignore[arg-type]
 
 
 @dataclass(frozen=True)
@@ -32,7 +38,7 @@ class Case:
     min_snr_db: float = 100.0
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "changes", tuple((f, n, float(np.float32(v))) for f, n, v in self.changes))
+        object.__setattr__(self, "changes", tuple((f, n, _f32(v)) for f, n, v in self.changes))
 
     def __str__(self) -> str:
         return self.kernel
@@ -43,6 +49,9 @@ class Case:
 
     def param_index(self, name: str) -> int:
         return [p[0] for p in self.info.params].index(name)
+
+    def event_index(self, name: str) -> int:
+        return [e[0] for e in self.info.events].index(name)
 
 
 CASES = [
@@ -108,6 +117,43 @@ CASES = [
             (4100, "gates_1", 0.0),
         ),
     ),
+    # Two notes at one frame, sustain, a retrigger, an off and on at one frame, a steal, a reset.
+    Case(
+        "synth.py",
+        "Synth",
+        (
+            (0, "note", (60.0, 0.8)),
+            (0, "note", (64.0, 0.6)),
+            (500, "note", (67.7, 0.7)),
+            (900, "hold", (1.0,)),
+            (1000, "off", (60.0,)),
+            (1300, "note", (64.0, 1.0)),
+            (1650, "bend", (2.0,)),
+            (1900, "hold", (0.0,)),
+            (2200, "off", (64.0,)),
+            (2200, "note", (64.0, 0.9)),
+            (2500, "note", (72.0, 0.5)),
+            (2500, "note", (76.0, 0.5)),
+            (3000, "reset", 0.0),
+            (3300, "note", (-3.5, 1.0)),
+            (3600, "release", 0.01),
+            (4000, "off", (-3.0,)),
+        ),
+    ),
+    # i32 truncates towards zero, saturates and maps NaN to 0; bool is `!= 0`.
+    Case(
+        "latch.py",
+        "Latch",
+        (
+            (100, "set", (67.7, 0.5, 0.1)),
+            (300, "set", (-3.5, 0.0, -2.5)),
+            (500, "set", (1e10, -0.0, 1e10)),
+            (700, "set", (-1e10, float("nan"), 3.0)),
+            (900, "set", (float("nan"), 1.0, 0.25)),
+            (1100, "set", (2147483520.0, 1.0, 0.0)),
+            (1300, "clear", ()),
+        ),
+    ),
     Case("glide.py", "Glide", ((0, "level", 440.0), (2000, "level", 0.0))),
     Case("wavetable.py", "Wavetable", ((1700, "freq", 1234.5), (3100, "reset", 0.0), (3900, "freq", 99.0))),
 ]
@@ -163,7 +209,9 @@ def reference(case: Case, x: np.ndarray, changes: tuple[Change, ...] | None = No
             block = kernel.process([channel[pos:frame].tolist() for channel in data], frame - pos)
             out = block if not out else [a + b for a, b in zip(out, block, strict=True)]
             pos = frame
-        if name == "reset":
+        if isinstance(value, tuple):
+            kernel.event(name, *value)
+        elif name == "reset":
             kernel.reset()
         elif name:
             kernel.set_param(name, value)
@@ -177,7 +225,12 @@ def run_driver(
     data = inputs(case, x)
     args = [str(exe), str(SAMPLE_RATE), blocks, "--frames", str(len(x))]
     for frame, name, value in changes:
-        args += ["--reset", str(frame)] if name == "reset" else ["--set", f"{frame}:{case.param_index(name)}:{value!r}"]
+        if isinstance(value, tuple):
+            args += ["--event", f"{frame}:{case.event_index(name)}:{','.join(map(repr, value))}"]
+        elif name == "reset":
+            args += ["--reset", str(frame)]
+        else:
+            args += ["--set", f"{frame}:{case.param_index(name)}:{value!r}"]
     proc = subprocess.run(args, input=data.T.astype(dtype).tobytes(), capture_output=True, check=True)
     return np.frombuffer(proc.stdout, dtype=dtype).astype(np.float64).reshape(-1, case.info.n_outputs).T
 

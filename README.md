@@ -2,7 +2,7 @@
 
 cignal compiles DSP kernels written in a static subset of Python to C99, for real-time audio hosts. The same source runs unchanged under CPython, as the reference model the C is tested against.
 
-- One C99 kernel ABI: a state struct, `init`, `process`, `set_param`, `reset`. No allocation, locks or I/O in the processing path.
+- One C99 kernel ABI: a state struct, `init`, `process`, `set_param`, `event`, `reset`. No allocation, locks or I/O in the processing path.
 
 - Host shims for [Pd](https://puredata.info/) externals and [SuperCollider](https://supercollider.github.io/) UGens, plus a standalone test driver.
 
@@ -10,7 +10,7 @@ cignal compiles DSP kernels written in a static subset of Python to C99, for rea
 
 The design follows [Vult](https://github.com/vult-dsp/vult). The full specification, with the reasons for each choice, is in [`docs/dev/spec.md`](docs/dev/spec.md).
 
-Status: pre-release. Nothing is published to PyPI yet.
+Status: 0.x, on [PyPI](https://pypi.org/project/cignal/). The language and the ABI may change before 1.0.
 
 ## Requirements
 
@@ -82,6 +82,32 @@ out = lp.process([[1.0] + [0.0] * 63], 64)  # one list per input channel
 
 Fields are state. `tick` sets the inputs and outputs: its parameters are input samples, and it returns one sample or a tuple. `init` runs once, and again on `reset`.
 
+### Events
+
+Parameters hold a value; events are calls. A method marked `@event` and named `on_<name>` runs when the host sends `<name>`, between blocks:
+
+```python
+from cignal import Array, Kernel, event, f32, i32
+
+
+class Synth(Kernel):
+    voices: Array[Voice, 4]  # Voice: a sub-kernel with `start` and `tick`
+    next: i32 = 0
+
+    @event
+    def on_note(self, note: i32, velocity: f32) -> None:
+        self.voices[self.next % 4].start(note, velocity)  # `% 4` proves the index
+        self.next = (self.next + 1) % 4
+
+    def tick(self) -> f32:
+        acc = 0.0
+        for i in range(4):
+            acc += self.voices[i].tick()
+        return acc
+```
+
+In Python, `synth.event("note", 60, 0.8)`. A note-off and a note-on in one block both run, in order, and re-sending a note retriggers it. Arguments are `f32`, `f64`, `i32` or `bool`; a host value converts to `i32` by truncation, saturating, with NaN as 0. `tests/fixtures/synth.py` is a full example with voice allocation and sustain.
+
 ## Build
 
 ```sh
@@ -95,9 +121,9 @@ uv run cignal fetch-headers                          # or `pd` / `sc`: host head
 
 A file with several kernels needs `--kernel NAME`, unless only one of them is not a field of another.
 
-- **Pd.** Inlets are the signal inputs, then one float inlet per parameter. Creation arguments set the parameters in order, and a `reset` message clears state. Pick a name that is not a Pd built-in with `--pd-name`: `biquad~` would load Pd's own object, without an error.
+- **Pd.** Inlets are the signal inputs, then one float inlet per parameter. Creation arguments set the parameters in order, and a `reset` message clears state. Events are messages on the left inlet: `note 60 0.8`. Pick a name that is not a Pd built-in with `--pd-name`: `biquad~` would load Pd's own object, without an error.
 
-- **SuperCollider.** Copy the plugin and the `.sc` class file into an extensions folder. UGen inputs are the signal inputs, then one input per parameter: `CignalLowpass.ar(sig, 800, 2)`. Parameters are read once per block. `/u_cmd node ugen "reset"` clears state.
+- **SuperCollider.** Copy the plugin and the `.sc` class file into an extensions folder. UGen inputs are the signal inputs, then one input per parameter: `CignalLowpass.ar(sig, 800, 2)`. Parameters are read once per block. `/u_cmd node ugen "reset"` clears state, and `/u_cmd node ugen "note" 60 0.8` sends an event.
 
 Both shims flush denormals to zero while the kernel runs, and restore the host's mode afterwards.
 
@@ -117,7 +143,11 @@ Both shims flush denormals to zero while the kernel runs, and restore the host's
 
 - **Smoothed parameters** (`param(..., smooth=0.01)`) glide per sample. `control` may not read them, because the value it saw would depend on block size. It may read `self.target("cutoff")`, the last value set.
 
+- **`f64` parameters** (`freq: f64 = param(...)`) keep their value and glide in `double` in the float build too. Use them for a pitch that a phase integrates.
+
 - **Array parameters** (`cutoffs: Array[f32, 8] = param(...)`) give each voice its own value. Hosts see `cutoffs_0` to `cutoffs_7`.
+
+- **Event methods need both `@event` and the `on_` prefix.** Names Pd uses itself, such as `bang`, `float` and `reset`, are reserved.
 
 - **Tables** (`@table(size=..., lo=..., hi=...)` on a module-level function) are sampled in CPython at build time and interpolated linearly. The function body can use anything, SciPy included.
 
@@ -143,11 +173,11 @@ Each fixture in `tests/fixtures/` is compiled and checked four ways:
 
 - the `double` build against CPython, bit for bit;
 
-- the `float` build against the `double` build, SNR >= 100 dB;
+- the `float` build against the `double` build, SNR >= 100 dB by default, set per case for a measured reason (the self-oscillating ladder passes at 90 dB);
 
 - six block-size patterns, which must give identical output;
 
-- in Pd and in SuperCollider, against the driver, bit for bit, with mid-stream parameter changes and resets.
+- in Pd and in SuperCollider, against the driver, bit for bit, with mid-stream parameter changes, resets and events.
 
 ## Layout
 
@@ -162,6 +192,7 @@ thirdparty/                Pd and SuperCollider headers for the tests, not packa
 bench/                     the benchmark runner and hand-written C references
 ci/linux.Containerfile     the Linux test image
 docs/dev/spec.md           the specification
+docs/dev/                  decision records: SIMD, events
 ```
 
 ## License

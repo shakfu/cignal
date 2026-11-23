@@ -10,6 +10,7 @@
 #define MAX_BLOCK 8192
 #define MAX_PATTERN 256
 #define MAX_CHANGES 256
+#define MAX_ARGS 16
 
 typedef ${sample} sample_t;
 
@@ -18,18 +19,22 @@ static sample_t out_buf[NOUT][MAX_BLOCK];
 
 typedef struct {
     long frame;
+    int kind; /* 0: --set, 1: --reset, 2: --event */
     int index;
+    int n_args;
     double value;
+    sample_t args[MAX_ARGS];
 } change_t;
 
 static int usage(const char *argv0) {
-    fprintf(stderr, "usage: %s SAMPLE_RATE BLOCKS [--frames N] [--set FRAME:INDEX:VALUE] [--reset FRAME]...\n",
+    fprintf(stderr, "usage: %s SAMPLE_RATE BLOCKS [--frames N] [--set FRAME:INDEX:VALUE] [--reset FRAME]\n"
+                    "    [--event FRAME:INDEX:ARG,ARG,...]...\n",
             argv0);
     return 2;
 }
 
 /* BLOCKS is a comma-separated block-size pattern, repeated until the input ends. A block also ends
-   at each --set or --reset frame, so the change takes effect at exactly that frame. Reads interleaved
+   at each --set, --reset or --event frame, so the change takes effect at exactly that frame. Reads interleaved
    native-endian samples from stdin (or runs --frames frames for a kernel without inputs) and writes
    interleaved output to stdout. */
 int main(int argc, char **argv) {
@@ -53,18 +58,25 @@ int main(int argc, char **argv) {
     for (int a = 3; a < argc; a++) {
         if (strcmp(argv[a], "--frames") == 0 && a + 1 < argc) {
             frames = atol(argv[++a]);
-        } else if ((strcmp(argv[a], "--set") == 0 || strcmp(argv[a], "--reset") == 0) && a + 1 < argc &&
-                   n_changes < MAX_CHANGES) {
+        } else if ((strcmp(argv[a], "--set") == 0 || strcmp(argv[a], "--reset") == 0 ||
+                    strcmp(argv[a], "--event") == 0) &&
+                   a + 1 < argc && n_changes < MAX_CHANGES) {
             change_t *c = &changes[n_changes];
+            memset(c, 0, sizeof *c);
             if (strcmp(argv[a], "--reset") == 0) {
-                c->index = -1; /* a reset, applied in order with the parameter changes */
-                c->value = 0;
+                c->kind = 1; /* applied in order with the other changes */
                 if (sscanf(argv[++a], "%ld", &c->frame) != 1) return usage(argv[0]);
+            } else if (strcmp(argv[a], "--event") == 0) {
+                int used = 0;
+                c->kind = 2;
+                if (sscanf(argv[++a], "%ld:%d:%n", &c->frame, &c->index, &used) != 2) return usage(argv[0]);
+                for (char *tok = strtok(argv[a] + used, ","); tok && c->n_args < MAX_ARGS; tok = strtok(NULL, ","))
+                    c->args[c->n_args++] = (sample_t)strtod(tok, NULL);
             } else if (sscanf(argv[++a], "%ld:%d:%lf", &c->frame, &c->index, &c->value) != 3) {
                 return usage(argv[0]);
             }
             if (n_changes > 0 && c->frame < changes[n_changes - 1].frame) {
-                fprintf(stderr, "--set and --reset frames must not decrease\n");
+                fprintf(stderr, "change frames must not decrease\n");
                 return 2;
             }
             n_changes++;
@@ -102,10 +114,13 @@ int main(int argc, char **argv) {
     int next = 0;
     for (int p = 0; pos < frames; p = (p + 1) % n_pattern) {
         while (next < n_changes && changes[next].frame <= pos) {
-            if (changes[next].index < 0)
+            const change_t *c = &changes[next];
+            if (c->kind == 1)
                 ${name}_reset(&kernel);
+            else if (c->kind == 2)
+                ${name}_event(&kernel, c->index, c->args);
             else
-                ${name}_set_param(&kernel, changes[next].index, (sample_t)changes[next].value);
+                ${name}_set_param(&kernel, c->index, (sample_t)c->value);
             next++;
         }
         long n = pattern[p];

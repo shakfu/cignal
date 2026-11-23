@@ -37,7 +37,7 @@ def test_pd_external_matches_driver(tmp_path: Path, driver: Driver, case: Case) 
     name = f"cignal_{case.kernel.lower()}~"
     build_pd_external(FIXTURES / case.fixture, tmp_path, case.kernel, pd_name=name)
     # The last value each case sets for every parameter, applied from the start.
-    values = {param: value for _, param, value in case.changes if param != "reset"}
+    values = {param: value for _, param, value in case.changes if param != "reset" and not isinstance(value, tuple)}
     settings = [(p[0], values.get(p[0], p[3])) for p in info.params]
     # Parameters before the last go in as creation arguments; the last goes to its float inlet.
     # A kernel without inputs takes its first parameter on the left inlet, so that one is sent there.
@@ -80,15 +80,25 @@ def test_pd_flushes_denormals(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("case", [c for c in CASES if c.changes], ids=str)
 def test_pd_changes_mid_stream_match_driver(tmp_path: Path, driver: Driver, case: Case) -> None:
-    """Parameter changes and resets sent while DSP runs, moved to the start of their 64-sample block."""
+    """Parameter changes, resets and events sent while DSP runs, moved to the start of their 64-sample block.
+
+    Pd reads `nan` in a message as a symbol, which `atom_getfloat` makes 0, so the driver gets 0 there too.
+    """
     assert PD is not None
     x = signals()["noise"]
     info = case.info
     name = f"cignal_{case.kernel.lower()}~"
     build_pd_external(FIXTURES / case.fixture, tmp_path, case.kernel, pd_name=name)
-    changes = tuple((frame - frame % 64, param, value) for frame, param, value in case.changes)
+    changes = tuple(
+        (frame - frame % 64, param, tuple(0.0 if v != v else v for v in value) if isinstance(value, tuple) else value)
+        for frame, param, value in case.changes
+    )
     events = tuple(
-        (frame, 0, "reset") if param == "reset" else (frame, case.param_index(param) + info.n_inputs, repr(value))
+        (frame, 0, " ".join([param, *map(repr, value)]))
+        if isinstance(value, tuple)
+        else (frame, 0, "reset")
+        if param == "reset"
+        else (frame, case.param_index(param) + info.n_inputs, repr(value))
         for frame, param, value in changes
     )
     signal = inputs(case, x) if info.n_inputs else np.zeros((1, FRAMES))

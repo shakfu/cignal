@@ -4,6 +4,7 @@ The graph is In.ar -> the cignal UGen -> Out.ar, with a Control UGen supplying t
 /n_set can change them mid-stream.
 """
 
+import math
 import struct
 import subprocess
 from pathlib import Path
@@ -69,7 +70,9 @@ def osc_message(address: str, *args: int | float | str | bytes) -> bytes:
 
 def _bundle(seconds: float, messages: list[bytes]) -> bytes:
     whole = int(seconds)
-    timetag = struct.pack(">II", whole, round((seconds - whole) * 2**32))
+    # Rounded up: a timetag a fraction of a sample before a block start ran the command a block early
+    # (measured: /u_cmd at frame 64, 128 and 448).
+    timetag = struct.pack(">II", whole, math.ceil((seconds - whole) * 2**32))
     body = b"#bundle\0" + timetag + b"".join(struct.pack(">i", len(m)) + m for m in messages)
     return struct.pack(">i", len(body)) + body
 

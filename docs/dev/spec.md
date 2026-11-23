@@ -103,6 +103,7 @@ Rules:
 | `init(self) -> None` | no | once, after fields take their defaults and `sample_rate` is set | `K_init` |
 | `control(self) -> None` | no | once per block, before the first `tick` | inside `K_process` |
 | `tick(self, *inputs: f32) -> f32 \| tuple[f32, ...]` | yes, on exported kernels | once per sample | `static inline` in the `.c` file |
+| `@event` `on_<name>(self, ...) -> None` | no | by the host, between `K_process` calls | `K_on_<name>`, and `K_event` by index |
 | other methods | no | by kernel code only | `static inline` |
 
 - `tick`'s parameters set the number of audio inputs. Its return type sets the number of outputs, at least one.
@@ -110,7 +111,9 @@ Rules:
 - `control` and `tick` do not call down. The parent calls its sub-kernels explicitly.
 - `control` runs at the start of every `K_process` call. Its effect is independent of the host's block size only if it computes from parameters and from fields `tick` does not change. The block-pattern tests (9.2) rely on this for the fixtures.
 - Methods of a kernel and its sub-kernels may call each other. The call graph must be acyclic (`CIGNAL.RECURSION`).
-- `process`, `set_param`, `reset` and `target` are reserved method names.
+- `process`, `set_param`, `reset`, `target` and `event` are reserved method names.
+- An event method needs both `@event` and the `on_` prefix; either alone is an error. Hosts see `<name>` without the prefix. Names Pd uses itself (`bang`, `float`, `list`, `reset`, ...) are reserved. Arguments are `f32`, `f64`, `i32` or `bool`. On a sub-kernel, an event method is a plain method its parent may call. The design is in [events.md](events.md).
+- An event may read anything, smoothed parameters included: it runs at a frame the host chose, not at a block start, so its effect does not depend on block size. Hosts get sample-accurate events by splitting `K_process` at the event's frame.
 - `K_reset` restores every field except the parameters and the sample rate, clears arrays and delays, resets sub-kernels (their `param` fields included, since those are plain fields), then re-runs `init`. `Kernel.reset()` does the same in the reference. There is no separate user hook: `init` already runs on reset.
 - Methods that nothing reachable from `tick`, `control` or `init` calls are type-checked but not emitted, since `-Wunused-function` rejects an unused static function.
 
@@ -118,7 +121,7 @@ Rules:
 
 `param(default, lo=, hi=)` marks a field as a host-controlled parameter. It is honoured only on the exported kernel. On a sub-kernel it is a plain field with a default.
 
-- Parameters are `f32`, and read-only in kernel code.
+- Parameters are `f32` or `f64`, and read-only in kernel code. Hosts set every parameter as a `sample`; an `f64` parameter widens the value, then clamps and smooths it in `double` in both builds. A pitch needs this: a phase integrates every rounding of its frequency, and an `f32` smoothed pitch measured 98 dB on the float build of the synth fixture, against 115 dB for `f64`.
 - Setters clamp to `[lo, hi]`. `Kernel.set_param` clamps the same way in the reference.
 - Parameters are set between blocks. Signal-rate parameters would make each one a buffer in the ABI; they are out of scope until a kernel needs them.
 - `cutoffs: Array[f32, N] = param(...)` declares N parameters with one range, default and smoothing, read through a proven index. Hosts see N scalar parameters named `cutoffs_0` to `cutoffs_{N-1}`, so the ABI and the shims are unchanged; a field with one of those names is an error. The named setter takes an element index and ignores one out of range: `K_set_cutoffs(k, element, v)`. Polyphony needs this: without it, voice 3's cutoff in an `Array[Voice, 8]` is one of 8 hand-declared parameters.
@@ -256,17 +259,23 @@ void Lowpass_set_cutoff(Lowpass *k, float v);
 void Lowpass_set_q(Lowpass *k, float v);
 void Lowpass_set_param(Lowpass *k, int index, float v);
 
+/* Events: one function per `on_<name>`, and a dispatcher taking host values by index. */
+void Lowpass_event(Lowpass *k, int index, const float *args);
+
 extern const cignal_kernel_info Lowpass_info;
 ```
 
 ```c
 /* Guarded by CIGNAL_INFO_TYPES, so several generated headers can share a translation unit. */
 typedef struct { const char *name; double lo, hi, def; } cignal_param_info;
+typedef struct { const char *name; int n_args; } cignal_event_info;
 typedef struct {
     const char *name;
     int n_inputs, n_outputs, n_params;
     const cignal_param_info *params;
     size_t size;                /* sizeof the kernel struct */
+    int n_events;
+    const cignal_event_info *events;
 } cignal_kernel_info;
 ```
 
@@ -277,6 +286,7 @@ ABI rules:
 - **`n` may be any value from 0 up**, and may vary between calls. Kernel state carries across calls. Processing in blocks of 64 then 64 gives the same output as one block of 128 (section 9.2).
 - **Input and output buffers may alias each other**, because Pd and other hosts process in place, and SuperCollider may reuse an input's buffer for an output. The buffer pointers are therefore not `restrict`. For each sample, the loop reads every input before it writes any output, which is safe for any pairing of channels.
 - **Buffers must not point into the kernel struct.** `K_process` declares `self` as `restrict` (in the definition only; the header stays valid C++). Without it, every write to `out` might change a field, and the compiler reloaded and stored all state on every sample: the biquad ran 1.7x slower than hand-written C.
+- **`K_event` converts each host value** to its argument's type: `i32` truncates towards zero, saturates, and maps NaN to 0, where a C cast is undefined; `bool` is `!= 0`. `kernel.event_i32` is the reference. An index out of range does nothing; `args` must hold `n_args` values.
 - **The ABI is single-threaded**: one thread per kernel instance at a time.
 - **The header has an `extern "C"` guard**, so C++ hosts link against the C symbols. The `.c` file is compiled as C, not C++: it uses compound literals, which C++ lacks.
 
@@ -304,10 +314,11 @@ A shim is a C template filled from `K_info`, produced with `string.Template` fro
 Shims, in order:
 
 1. **`driver`** (v1, required): a standalone `main` that reads interleaved native-endian samples from stdin and writes them to stdout. The sample rate and a block-size pattern come from the command line. Tests and benchmarks use it.
-2. **Pd** (v1, M0; parameters in M1). Inlets are the signal inputs, then one float inlet per parameter. A kernel without signal inputs takes its first parameter on the left inlet, as `osc~` does. Creation arguments set the parameters in order. The shim re-applies every parameter at the start of each block, which also restores them after a sample-rate change re-runs `K_init`. The object name defaults to the lowercased kernel name plus `~`, and `--pd-name` overrides it. A name that matches a Pd built-in (`biquad~`, `lop~`) loads the built-in instead, without an error.
+2. **Pd** (v1, M0; parameters in M1). Inlets are the signal inputs, then one float inlet per parameter. A kernel without signal inputs takes its first parameter on the left inlet, as `osc~` does. Creation arguments set the parameters in order. The shim re-applies every parameter at the start of each block, which also restores them after a sample-rate change re-runs `K_init`. The object name defaults to the lowercased kernel name plus `~`, and `--pd-name` overrides it. A name that matches a Pd built-in (`biquad~`, `lop~`) loads the built-in instead, without an error. Each event is a message on the left inlet, `note 60 0.8`; missing arguments are 0. The shim applies pending parameter inlets before an event, so the event sees every parameter sent before it. Pd parses `nan` in a message as a symbol, which arrives as 0.
 3. **SuperCollider** (M4). `cignal build --shim sc` writes and compiles a UGen plugin (`.so` on Linux, `.scx` on macOS) and its sclang class file.
    - The UGen name defaults to `Cignal` plus the kernel name, to stay clear of core UGens; `--sc-name` overrides it.
    - Inputs are the signal inputs, then one input per parameter, read once per block. A `reset` unit command (`/u_cmd node ugen "reset"`) calls `K_reset`.
+   - Each event is a unit command: `/u_cmd node ugen "note" 60 0.8`. An event sees the parameters as of the last block, since inputs are read in the calculation function.
    - The constructor sets the first output sample to 0 instead of calling the calculation function once, as many UGens do. Running a sample in the constructor would process the first input sample twice.
    - The kernel struct sits inside the `Unit`, which scsynth allocates from its real-time pool; a delay line's buffer counts against that pool.
    - SuperCollider buffers are `float`; the shim refuses another sample type at compile time.

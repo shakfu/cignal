@@ -76,6 +76,19 @@ class Table:
         return a + frac * (self.values[i + 1] - a)
 
 
+def event[M: Callable[..., None]](method: M) -> M:
+    """Mark a method `on_<name>` as event `<name>`, which hosts call between `process` calls."""
+    setattr(method, "_cignal_event", True)  # noqa: B010 - functions take attributes; mypy rejects the dot form
+    return method
+
+
+def event_i32(value: float) -> int:
+    """An event argument as `i32`: truncated towards zero, saturated, NaN to 0. The C dispatcher does the same."""
+    if value != value:
+        return 0
+    return -(2**31) if value <= -(2.0**31) else 2**31 - 1 if value >= 2.0**31 - 1 else int(value)
+
+
 def table(*, size: int, lo: float, hi: float) -> Callable[[Callable[[float], float]], Table]:
     """Sample a one-argument function at `size + 1` evenly spaced points in [lo, hi], in f64."""
     return lambda function: Table(function, size, lo, hi)
@@ -250,6 +263,18 @@ class Kernel:
             raise KeyError(f"{type(self).__name__} has no parameter {name!r}")
         slot = (name, index)
         return self._smoothing[slot][0] if slot in self._smoothing else float(self._get(slot))
+
+    def event(self, name: str, *args: float) -> None:
+        """Deliver event `name` (method `on_<name>`), converting each host value to the argument's type."""
+        method = getattr(type(self), f"on_{name}", None)
+        if not getattr(method, "_cignal_event", False):
+            raise KeyError(f"{type(self).__name__} has no event {name!r}")
+        types = [t for k, t in inspect.get_annotations(method, eval_str=True).items() if k != "return"]
+        if len(args) != len(types):
+            raise TypeError(f"event {name!r} takes {len(types)} argument(s), got {len(args)}")
+        pairs = zip(types, args, strict=True)
+        converted = [event_i32(v) if t is int else v != 0 if t is bool else float(v) for t, v in pairs]
+        getattr(self, f"on_{name}")(*converted)
 
     def _get(self, slot: tuple[str, int | None]) -> float:
         name, k = slot
