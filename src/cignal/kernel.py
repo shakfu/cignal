@@ -99,14 +99,15 @@ class Array(list[Any]):
     def __class_getitem__(cls, item: tuple[Any, int]) -> Spec:  # type: ignore[override]
         return Spec(cls, item[0], item[1])
 
-    def __init__(self, spec: Spec, sample_rate: float = 0.0) -> None:
+    def __init__(self, spec: Spec, sample_rate: float = 0.0, fill: float | None = None) -> None:
+        """`fill` is the default of an `Array` parameter: `cutoffs: Array[f32, 8] = param(...)`."""
         element: Any = spec.element
         if isinstance(element, Spec):
             super().__init__(element.kind(element) for _ in range(spec.size))
         elif isinstance(element, type) and issubclass(element, Kernel):
             super().__init__(element(sample_rate) for _ in range(spec.size))  # each runs `init`, in order
         else:
-            self.zero = element()
+            self.zero = element() if fill is None else fill
             super().__init__(self.zero for _ in range(spec.size))
 
     def clear(self) -> None:
@@ -179,15 +180,24 @@ class Kernel:
             if isinstance(value, Param):
                 setattr(self, name, float(value.default))
         self.sample_rate = float(sample_rate)
-        # Smoothed parameters: name -> [target, coefficient].
+        hints = inspect.get_annotations(cls, eval_str=True)
+        # Host parameter names: `x`, or `x_k` for element k of an `Array` parameter -> (field, element).
+        self._slots: dict[str, tuple[str, int | None]] = {}
+        for name, p in vars(cls).items():
+            if isinstance(p, Param):
+                size = hint.size if isinstance(hint := hints.get(name), Spec) else 0
+                self._slots |= {f"{name}_{k}": (name, k) for k in range(size)} if size else {name: (name, None)}
+        # Smoothed parameters: (field, element) -> [target, coefficient].
         self._smoothing = {
-            name: [float(p.default), smooth_coefficient(p.smooth, self.sample_rate)]
-            for name, p in vars(cls).items()
-            if isinstance(p, Param) and p.smooth > 0
+            slot: [float(p.default), smooth_coefficient(p.smooth, self.sample_rate)]
+            for slot in self._slots.values()
+            if (p := vars(cls)[slot[0]]).smooth > 0
         }
-        for name, hint in inspect.get_annotations(cls, eval_str=True).items():
+        for name, hint in hints.items():
             if isinstance(hint, Spec):
-                setattr(self, name, Array(hint, self.sample_rate) if hint.kind is Array else hint.kind(hint))
+                p = vars(cls).get(name)
+                fill = float(p.default) if isinstance(p, Param) else None
+                setattr(self, name, Array(hint, self.sample_rate, fill) if hint.kind is Array else hint.kind(hint))
             elif isinstance(hint, type) and issubclass(hint, Kernel) and name not in vars(cls):
                 setattr(self, name, hint(sample_rate))
         self.init()
@@ -207,7 +217,8 @@ class Kernel:
         for name, hint in inspect.get_annotations(cls, eval_str=True).items():
             default = vars(cls).get(name)
             if isinstance(hint, Spec):
-                getattr(self, name).clear()
+                if not (keep_params and isinstance(default, Param)):
+                    getattr(self, name).clear()
             elif isinstance(hint, type) and issubclass(hint, Kernel):
                 # A sub-kernel's parameters are plain fields, so they reset too.
                 getattr(self, name)._reset(keep_params=False)
@@ -219,15 +230,37 @@ class Kernel:
         self.init()
 
     def set_param(self, name: str, value: float) -> None:
-        """Set a parameter, clamped to its range exactly as the generated setter does."""
-        p = vars(type(self)).get(name)
-        if not isinstance(p, Param):
+        """Set a parameter by host name (`x`, or `x_k` for an `Array` element), clamped like the C setter."""
+        if name not in self._slots:
             raise KeyError(f"{type(self).__name__} has no parameter {name!r}")
+        slot = self._slots[name]
+        p = vars(type(self))[slot[0]]
         clamped = p.lo if value < p.lo else p.hi if value > p.hi else value
-        if name in self._smoothing:
-            self._smoothing[name][0] = clamped
+        if slot in self._smoothing:
+            self._smoothing[slot][0] = clamped
         else:
-            setattr(self, name, clamped)
+            self._put(slot, clamped)
+
+    def target(self, name: str, index: int | None = None) -> float:
+        """The value parameter `name` (element `index` of an `Array` one) glides towards, or the parameter.
+
+        It changes only when the host sets the parameter, so `control` may read it.
+        """
+        if not isinstance(vars(type(self)).get(name), Param):
+            raise KeyError(f"{type(self).__name__} has no parameter {name!r}")
+        slot = (name, index)
+        return self._smoothing[slot][0] if slot in self._smoothing else float(self._get(slot))
+
+    def _get(self, slot: tuple[str, int | None]) -> float:
+        name, k = slot
+        return float(getattr(self, name) if k is None else getattr(self, name)[k])
+
+    def _put(self, slot: tuple[str, int | None], value: float) -> None:
+        name, k = slot
+        if k is None:
+            setattr(self, name, value)
+        else:
+            getattr(self, name)[k] = value
 
     def process(self, inputs: Sequence[Sequence[float]], n: int) -> list[list[float]]:
         """Run `control`, then `tick` over `n` samples of `inputs` (one sequence per channel)."""
@@ -235,8 +268,8 @@ class Kernel:
         tick = getattr(self, "tick")  # noqa: B009 - subclasses define tick; the base class does not
         outputs: list[list[float]] = []
         for i in range(n):
-            for name, (target, coef) in self._smoothing.items():
-                setattr(self, name, smooth_step(getattr(self, name), target, coef))
+            for slot, (target, coef) in self._smoothing.items():
+                self._put(slot, smooth_step(self._get(slot), target, coef))
             result = tick(*(channel[i] for channel in inputs))
             values = result if isinstance(result, tuple) else (result,)
             if not outputs:

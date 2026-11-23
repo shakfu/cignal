@@ -115,7 +115,9 @@ Both shims flush denormals to zero while the kernel runs, and restore the host's
 
 - **`Delay.read(d)` counts from 1.** `read(1)` is the newest sample, so `read(D)` before `write(x)` delays by exactly D samples.
 
-- **Smoothed parameters** (`param(..., smooth=0.01)`) glide per sample. `control` may not read them, because the value it saw would depend on block size.
+- **Smoothed parameters** (`param(..., smooth=0.01)`) glide per sample. `control` may not read them, because the value it saw would depend on block size. It may read `self.target("cutoff")`, the last value set.
+
+- **Array parameters** (`cutoffs: Array[f32, 8] = param(...)`) give each voice its own value. Hosts see `cutoffs_0` to `cutoffs_7`.
 
 - **Tables** (`@table(size=..., lo=..., hi=...)` on a module-level function) are sampled in CPython at build time and interpolated linearly. The function body can use anything, SciPy included.
 

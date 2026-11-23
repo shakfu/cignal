@@ -12,6 +12,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 - Freeverb and Moog-ladder fixtures, written to find what a real kernel needs; the three items above came from them. The float-build SNR threshold is now per case: the ladder self-oscillates at `res=1.1`, where the builds drift in phase, and passes at 90 dB (spec 9.1).
 
+- `self.target("cutoff")` reads the value a parameter glides towards. It changes only between blocks, so `control` may read it, where reading the smoothed parameter is an error. On an unsmoothed parameter it reads the parameter. `target` is now a reserved method name.
+
+- `Array` parameters: `cutoffs: Array[f32, 4] = param(1000.0, lo=20.0, hi=20000.0, smooth=0.002)` gives each voice its own value. Hosts see 4 scalar parameters, `cutoffs_0` to `cutoffs_3`, so Pd gets one inlet and SuperCollider one input per element, and neither shim changed. The alternative, an indexed setter in the ABI, needed new routing in every host. `K_set_cutoffs(k, element, v)` takes the element index.
+
+### Changed
+
+- Under GCC, a `range` loop with constant bounds and 2 to 16 iterations is fully unrolled. GCC `-O2` ran each sub-kernel of an `Array[K, 8]` in turn, so their dependency chains did not overlap: an 8-biquad bank went from 25.4 to 6.5 ns/frame, Freeverb from 13.1 to 11.2. clang already unrolled the bank, and forcing it slowed an 8-voice ladder by 12%, so the macro is empty there (`docs/dev/simd.md`).
+
+- Kernels without inputs run the differential tests on one signal, not five, so the suite reports no skips.
+
 ## [0.0.2]
 
 ### Added

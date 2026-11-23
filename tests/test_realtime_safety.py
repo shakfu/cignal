@@ -10,9 +10,10 @@ from cignal.build import compile_object, write_kernel
 from cignal.compiler import compile_kernel
 
 # Calls compilers substitute for source code. Apple clang fuses sinf/cosf pairs into libm's sincos, and
-# turns zero-fill loops into bzero/memset. None of these allocate, lock or do I/O.
+# turns fill loops into bzero/memset, or memset_pattern16 for a repeated non-zero value. None of these
+# allocate, lock or do I/O.
 COMPILER_LIBM = {"__sincosf_stret", "__sincos_stret", "sincosf", "sincos"}
-COMPILER_MEMORY = {"bzero", "__bzero", "memset", "memcpy", "memmove"}
+COMPILER_MEMORY = {"bzero", "__bzero", "memset", "memset_pattern16", "memcpy", "memmove"}
 
 
 @pytest.mark.parametrize("case", CASES, ids=str)

@@ -185,3 +185,51 @@ def test_only_tuples_indexed_at_run_time_are_emitted(tmp_path: Path) -> None:
     assert "static const int32_t cignal_const_USED[3] = {\n    1, 2, 3\n};" in c
     assert "static const bool cignal_const_FLAGS[2]" in c
     assert "0.25f" in c and "cignal_const_FOLDED" not in c and "UNUSED" not in c
+
+
+def test_only_short_constant_loops_are_unrolled(tmp_path: Path) -> None:
+    path = tmp_path / "k.py"
+    path.write_text(
+        textwrap.dedent("""
+        from cignal import Kernel, f32, i32
+
+        class K(Kernel):
+            n: i32 = 3
+
+            def tick(self, x: f32) -> f32:
+                for a in range(8, 0, -2):
+                    x += 1.0
+                for b in range(1):
+                    x += 1.0
+                for c in range(17):
+                    x += 1.0
+                for d in range(self.n):
+                    x += 1.0
+                return x
+    """)
+    )
+    c = compile_kernel(path).source
+    assert [line for line in c.splitlines() if "CIGNAL_UNROLL(" in line and "for (" in line] == [
+        "    CIGNAL_UNROLL(4) for (int32_t a = 8; a > 0; a -= 2) {"
+    ]
+
+
+def test_target_reads_the_setter_value_of_a_smoothed_param_and_the_field_otherwise(tmp_path: Path) -> None:
+    path = tmp_path / "k.py"
+    path.write_text(
+        textwrap.dedent("""
+        from cignal import Kernel, f32, param
+
+        class K(Kernel):
+            a: f32 = param(1.0, lo=0.0, hi=2.0, smooth=0.01)
+            b: f32 = param(1.0, lo=0.0, hi=2.0)
+            held: f32 = 0.0
+
+            def control(self) -> None:
+                self.held = self.target("a") + self.target("b")
+
+            def tick(self, x: f32) -> f32:
+                return x * self.held
+    """)
+    )
+    assert "self->held = self->cignal_target_a + self->b;" in compile_kernel(path).source

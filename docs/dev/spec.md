@@ -110,7 +110,7 @@ Rules:
 - `control` and `tick` do not call down. The parent calls its sub-kernels explicitly.
 - `control` runs at the start of every `K_process` call. Its effect is independent of the host's block size only if it computes from parameters and from fields `tick` does not change. The block-pattern tests (9.2) rely on this for the fixtures.
 - Methods of a kernel and its sub-kernels may call each other. The call graph must be acyclic (`CIGNAL.RECURSION`).
-- `process`, `set_param` and `reset` are reserved method names.
+- `process`, `set_param`, `reset` and `target` are reserved method names.
 - `K_reset` restores every field except the parameters and the sample rate, clears arrays and delays, resets sub-kernels (their `param` fields included, since those are plain fields), then re-runs `init`. `Kernel.reset()` does the same in the reference. There is no separate user hook: `init` already runs on reset.
 - Methods that nothing reachable from `tick`, `control` or `init` calls are type-checked but not emitted, since `-Wunused-function` rejects an unused static function.
 
@@ -120,11 +120,13 @@ Rules:
 
 - Parameters are `f32`, and read-only in kernel code.
 - Setters clamp to `[lo, hi]`. `Kernel.set_param` clamps the same way in the reference.
-- Parameters are scalars, set between blocks. Signal-rate parameters would make each one a buffer in the ABI; they are out of scope until a kernel needs them.
+- Parameters are set between blocks. Signal-rate parameters would make each one a buffer in the ABI; they are out of scope until a kernel needs them.
+- `cutoffs: Array[f32, N] = param(...)` declares N parameters with one range, default and smoothing, read through a proven index. Hosts see N scalar parameters named `cutoffs_0` to `cutoffs_{N-1}`, so the ABI and the shims are unchanged; a field with one of those names is an error. The named setter takes an element index and ignores one out of range: `K_set_cutoffs(k, element, v)`. Polyphony needs this: without it, voice 3's cutoff in an `Array[Voice, 8]` is one of 8 hand-declared parameters.
 - Setters run on the audio thread or between `K_process` calls. There are no atomics in v1. Any cross-thread handoff is the shim's job.
 - `param(..., smooth=seconds)` (M3) makes the field a one-pole glide towards the last value set. It steps once per sample, before `tick`. The setter changes only the target. The coefficient is `1 - exp(-1 / (seconds * sample_rate))`, computed in `double` at init. `kernel.smooth_step` defines the step, and the C repeats it operation for operation.
 - The step snaps to the target when it makes no progress (`value + coef * d == value`), or when `|d| < 1e-20`. Without the first condition, a float smoother stalls once `coef * d` is below half a unit in the last place: the float build of the glide fixture stopped at 439.99927 for a target of 440, while the double build converged. The second condition snaps a glide towards 0 before it reaches denormals.
 - `control` may not read a smoothed parameter, directly or through methods it calls (`CIGNAL.BAD_PARAM`). The value it saw would depend on where block boundaries fall. Read it in `tick`.
+- `self.target("name")` (`self.target("name", i)` for an `Array` parameter) reads the last value set, which changes only between blocks, so `control` may read it. For an unsmoothed parameter it is the parameter itself, so adding or dropping `smooth=` does not break the call. The name must be a string literal naming a parameter of the exported kernel.
 - `reset` keeps smoothed parameters as they are, including a glide in progress.
 
 ### 3.5 Free functions and constants
@@ -284,7 +286,7 @@ Every generated file must compile cleanly with `-std=c99 -Wall -Wextra -Wpedanti
 
 Generated code must contain no references to `malloc`, `free`, `printf`, locks, `setjmp` or any symbol outside libm. The test suite checks the undefined symbols of the compiled object with `nm` (section 9.3).
 
-`tick` and helpers are `static inline`. Parentheses follow C precedence, and a right operand keeps them at equal precedence, so the C evaluation tree is the Python one: float `a + (b + c)` is never reassociated. Locals are declared at their first assignment, unless that assignment is inside a branch; then the declaration is hoisted with a zero initialiser. Prototypes are emitted only for methods called before their definition. `K_process` is a loop over `n` that calls `tick`. Branches on build-time constants are folded.
+`tick` and helpers are `static inline`. Parentheses follow C precedence, and a right operand keeps them at equal precedence, so the C evaluation tree is the Python one: float `a + (b + c)` is never reassociated. Locals are declared at their first assignment, unless that assignment is inside a branch; then the declaration is hoisted with a zero initialiser. Prototypes are emitted only for methods called before their definition. `K_process` is a loop over `n` that calls `tick`. Branches on build-time constants are folded. A `range` loop with constant bounds and 2 to 16 iterations is marked `CIGNAL_UNROLL(n)`, which forces full unrolling under GCC and is empty elsewhere ([simd.md](simd.md#unrolling)).
 
 `-ffast-math` is not the default because reassociation breaks the comparison with the `f64` reference. `cignal build --fast-math` adds the flags to the build recipe it prints, and the tests then switch to the SNR check only.
 

@@ -31,6 +31,7 @@ class K(Kernel):
 """
 )
 SMOOTH = "g: f32 = param(1.0, lo=0.0, hi=2.0, smooth=0.01)\n"
+ARRAY_PARAM = "g: Array[f32, 2] = param(1.0, lo=0.0, hi=2.0)\n"
 
 FREE_CALLER = "class K(Kernel):\n    def tick(self, x: f32) -> f32:\n        return f(x)\n"
 
@@ -91,6 +92,29 @@ CASES = [
         8,
     ),
     (RuleId.BAD_PARAM, kernel("g: f32 = param(1.0, lo=0.0, hi=2.0, smooth=-1.0)"), 5),
+    (RuleId.BAD_PARAM, kernel("k: f32 = 0.0", tick='return self.target("k")'), 7),
+    (RuleId.BAD_PARAM, kernel(SMOOTH, tick='return self.target("g" if x > 0.0 else "g")'), 7),
+    (
+        RuleId.BAD_PARAM,
+        # A sub-kernel's parameters are plain fields, so nothing glides.
+        HEADER + "class S(Kernel):\n    " + SMOOTH + "    def tick(self, x: f32) -> f32:\n"
+        "        return self.target('g')\nclass K(Kernel):\n    s: S\n    def tick(self, x: f32) -> f32:\n"
+        "        return self.s.tick(x)\n",
+        7,
+    ),
+    (RuleId.BAD_SIGNATURE, kernel("def target(self) -> f32:\n    return 0.0"), 5),
+    (RuleId.UNSUPPORTED_SYNTAX, kernel(ARRAY_PARAM, tick="self.g[0] = x\nreturn x"), 7),
+    (
+        RuleId.BAD_PARAM,
+        kernel(
+            ARRAY_PARAM.replace(")", ", smooth=0.01)") + "k: f32 = 0.0\ndef control(self) -> None:\n"
+            "    self.k = self.g[0]"
+        ),
+        8,
+    ),
+    (RuleId.BAD_PARAM, kernel(ARRAY_PARAM, tick='return self.target("g")'), 7),
+    (RuleId.BAD_PARAM, kernel(ARRAY_PARAM + "g_1: f32 = 0.0"), 4),
+    (RuleId.BAD_PARAM, kernel(ARRAY_PARAM.replace("f32", "i32")), 5),
     (RuleId.UNSUPPORTED_SYNTAX, kernel("n: i32 = 2", tick="return x + f32(self.n ** self.n)"), 7),
     (RuleId.UNSUPPORTED_SYNTAX, kernel("n: i32 = 2", tick="return x + f32(self.n ** -1)"), 7),
     (RuleId.TYPE_MISMATCH, kernel(tick="return f32(i32(x) & 3) + x * 2.0 % 1.0 + f32(x & 1.0)"), 6),

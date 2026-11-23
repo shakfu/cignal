@@ -44,6 +44,17 @@ clang's optimisation remarks (`-Rpass=slp-vectorizer`) showed the SoA bank body 
 4. **Transcendental-heavy kernels gain 1.2 to 1.4x.** Scalar `tanhf` calls dominate. A vector libm gave no further gain and broke bit-exactness.
 5. **GCC `-O2` does not interleave the loop over sub-kernels**: AoS and 8 instances both run at 25.5 ns. Full unrolling of small constant `range` loops in the compiler would likely fix it (untested).
 
+## Unrolling
+
+Follow-up to finding 5, same harness. `#pragma GCC unroll N` on every constant loop, ns per frame:
+
+| | GCC `-O2` before | after | GCC `-O3 -mcpu=native` before | after | clang `-O2` before | after |
+|-|-|-|-|-|-|-|
+| Bank, AoS | 25.4 | 6.5 | 6.5 | 6.5 | 8.1 | 8.1 |
+| Ladders, AoS | 764 | 609 | 631 | 603 | 338 | 378 |
+
+Unrolling only the 8-voice loops left clang's ladders about 10% slower. The compiler therefore emits `CIGNAL_UNROLL(n)`, which expands to the pragma only under GCC 8 or later. Freeverb under GCC `-O2`: 13.1 to 11.2 ns/frame. Unrolling does not reorder floating-point operations, so output should not change; CI's GCC differential tests check this bit for bit.
+
 ## Limits
 
 - One machine and one architecture. No x86 measurement.

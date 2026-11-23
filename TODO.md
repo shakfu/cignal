@@ -38,9 +38,9 @@ Design questions are argued in [`docs/dev/spec.md`](docs/dev/spec.md) section 13
 
 - [ ] **Is field layout ABI?** Decide at the v1.0 freeze. Not ABI allows a struct-of-arrays `Array[K, N]`; ABI lets hosts read fields.
 
-- [ ] **Per-voice parameters.** Parameters are scalars, so a host cannot set the cutoff of voice 3 in `Array[Voice, 8]` without 8 named parameters. Polyphony needs this.
+- [x] **Per-voice parameters** (spec 3.4). `Array[f32, N] = param(...)`, seen by hosts as N scalar parameters.
 
-- [ ] **Coefficients from smoothed parameters.** `control` may not read a smoothed parameter, so the ladder computes `exp` for its coefficient every sample (90 ns/frame). Option: a per-N-sample hook.
+- [x] **Coefficients from smoothed parameters.** `control` reads `self.target("cutoff")`. The premise was wrong: moving the ladder's `exp` to `control` and gliding the coefficient instead left it at 83 ns/frame, since its 20 `tanh` calls dominate. A hand-written `f32` coefficient glide also cost 15 to 30 dB of float SNR (`f64` state fixed it), so the ladder keeps its smoothed cutoff.
 
 - [ ] **macOS CI job.** CI covers GCC and glibc only; clang and Apple's libm are checked only on a developer machine.
 
@@ -48,7 +48,9 @@ Design questions are argued in [`docs/dev/spec.md`](docs/dev/spec.md) section 13
 
 - [x] **New fixtures in `bench/run.py`.**
 
-- [ ] **Loops over sub-kernel arrays at `-O2`.** Freeverb with `Array[Comb, 8]` measured 1.2 to 1.5x slower than hand-unrolled at `-O2` on clang, and level at `-O3 -mcpu=native`. GCC `-O2` gains nothing from `Array[K, 8]` over 8 instances (`docs/dev/simd.md`). Option: fully unroll `range` loops with small constant bounds.
+- [ ] **Loops over sub-kernel arrays at clang `-O2`.** Freeverb with `Array[Comb, 8]` measured 1.2 to 1.5x slower than hand-unrolled, and level at `-O3 -mcpu=native`. Timings were noisy. Forcing unrolling on clang slowed the ladders by 12%, so it is GCC-only (`docs/dev/simd.md`).
+
+- [x] **Loops over sub-kernel arrays at GCC `-O2`.** Short constant loops are unrolled under GCC: 3.9x on the 8-biquad bank, 1.15x on Freeverb.
 
 - [ ] **Struct-of-arrays layout for `Array[K, N]`**. 1.5 to 1.9x on an 8-voice biquad bank, bit-exact (`docs/dev/simd.md`).
 

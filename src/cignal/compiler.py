@@ -40,7 +40,7 @@ _BUILTINS = ("abs", "min", "max")
 _MATH_CONSTANTS = {"pi": math.pi, "tau": math.tau, "e": math.e}
 _CASTS = {"f32": float, "f64": float, "i32": int}
 _LIFECYCLE = ("init", "control", "tick")
-_RESERVED_METHODS = ("process", "set_param", "reset")
+_RESERVED_METHODS = ("process", "set_param", "reset", "target")
 
 
 def _py_mod(a: Number, b: Number) -> Number:
@@ -238,6 +238,17 @@ for _t in ("float", "double", "int32_t"):
 _HELPERS["abs_int32_t"] = """static inline int32_t cignal_abs_int32_t(int32_t a) {
     return a < 0 ? (int32_t)(0u - (uint32_t)a) : a;
 }"""
+# GCC -O2 does not unroll a loop over sub-kernels, which serialises their dependency chains: 3.9x slower on
+# an 8-biquad bank (docs/dev/simd.md). clang unrolls these already, and forcing it slowed the ladders by 12%.
+_HELPERS["unroll"] = """#ifndef CIGNAL_UNROLL
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 8
+#define CIGNAL_PRAGMA(x) _Pragma(#x)
+#define CIGNAL_UNROLL(n) CIGNAL_PRAGMA(GCC unroll n)
+#else
+#define CIGNAL_UNROLL(n)
+#endif
+#endif"""
+MAX_UNROLL = 16  # trip counts up to this are fully unrolled under GCC
 # Helpers a helper calls, emitted before it.
 _HELPER_DEPS = {"delay_read_frac_float": ["delay_read_float"], "delay_read_frac_double": ["delay_read_double"]}
 _HELPER_SYMBOLS = {
@@ -578,6 +589,11 @@ class _FunctionLowerer:
             assert field_.type is not None
             return code, field_.type, None
         if isinstance(target, ast.Subscript):
+            if isinstance(target.value, ast.Attribute) and self._member(target.value)[1].param is not None and \
+                    self.kernel.exported:  # fmt: skip
+                self.errors.add(RuleId.UNSUPPORTED_SYNTAX, f"assigning parameter `{ast.unparse(target.value)}`",
+                                target, "parameters are set by the host; copy the value into a field")  # fmt: skip
+                raise _Abort
             code, t = self._subscript(target)
             return code, t, None
         self._unsupported(target, f"assignment to `{ast.unparse(target)}`")
@@ -662,8 +678,10 @@ class _FunctionLowerer:
             raise _Abort
         assert isinstance(step, int)
         proven: tuple[int, int] | None = None
+        trips = 0
         if start.is_const and stop.is_const:
             values = range(int(start.value or 0), int(stop.value or 0), step)
+            trips = len(values)
             proven = (min(values), max(values)) if values else (0, 0)  # an empty loop body never runs
         var = c_name(name)
         bound = self._coerce(stop, "i32", call)
@@ -674,7 +692,10 @@ class _FunctionLowerer:
             bound, depth = temp, depth + 1
         cmp = "<" if step > 0 else ">"
         increment = f"{var}++" if step == 1 else f"{var} += {step}" if step > 0 else f"{var} -= {-step}"
-        self._emit(depth, f"for (int32_t {var} = {self._coerce(start, 'i32', call)}; {var} {cmp} {bound}; "
+        unroll = f"CIGNAL_UNROLL({trips}) " if 1 < trips <= MAX_UNROLL else ""
+        if unroll:
+            self.helpers.add("unroll")
+        self._emit(depth, f"{unroll}for (int32_t {var} = {self._coerce(start, 'i32', call)}; {var} {cmp} {bound}; "
                    f"{increment}) {{")  # fmt: skip
         self.loop_vars[name] = proven
         self.loop_depth += 1
@@ -839,6 +860,9 @@ class _FunctionLowerer:
         if field_.array is None:
             self._unsupported(node, f"subscript of `{ast.unparse(node.value)}`, which is not an `Array`")
         element, size = field_.array
+        if field_.smooth > 0 and self._receiver(node.value.value) == ("self->", "self", self.kernel) and \
+                self.kernel.exported:  # fmt: skip
+            self.smoothed_reads.append(node)
         return f"{code}[{self._proven_index(node.slice, self._expr(node.slice), size)}]", element
 
     def _proven_index(self, node: ast.expr, index: _Expr, size: int) -> str:
@@ -1101,6 +1125,8 @@ class _FunctionLowerer:
                 if found is not None and found[1].delay is not None:
                     return self._delay_call(found[0], found[1].delay, func.attr, node)
             receiver = self._receiver(func.value)
+            if receiver is not None and func.attr == "target":
+                return self._target_call(receiver[2], node)
             if receiver is not None:
                 return self._method_call(receiver, func.attr, node)
         self.errors.add(RuleId.UNSUPPORTED_CALL, f"call to `{ast.unparse(func)}`", node,
@@ -1124,6 +1150,24 @@ class _FunctionLowerer:
             self.program.tuples.add(signature.returns)
         call = f"{model.cname}_{name}({', '.join([pointer, *args])})"
         return _Expr(call, signature.returns if signature.returns is not None else NONE)
+
+    def _target_call(self, model: "_KernelModel", node: ast.Call) -> _Expr:
+        """`self.target("cutoff")`: the value a parameter glides towards, which changes only between blocks."""
+        arg = node.args[0] if node.args else None
+        name = arg.value if isinstance(arg, ast.Constant) and isinstance(arg.value, str) else None
+        field_ = model.fields.get(name) if name is not None and model is self.kernel else None
+        if field_ is None or field_.param is None or not model.exported or \
+                len(node.args) != (2 if field_.array else 1):  # fmt: skip
+            self.errors.add(RuleId.BAD_PARAM, "`target` takes the name of a parameter of the exported kernel, "
+                            "as a string literal, and an index for an `Array` parameter", node,
+                            'e.g. `self.target("cutoff")` or `self.target("cutoffs", i)`')  # fmt: skip
+            raise _Abort
+        assert name is not None
+        code = f"self->cignal_target_{name}" if field_.smooth > 0 else f"self->{c_name(name)}"
+        if field_.array is None:
+            return _Expr(code, field_.type)
+        index = self._proven_index(node.args[1], self._expr(node.args[1]), field_.array[1])
+        return _Expr(f"{code}[{index}]", field_.array[0])
 
     def _free_call(self, name: str, node: ast.Call) -> _Expr:
         signature = self.program.free_function(name)
@@ -1357,6 +1401,12 @@ class _KernelModel:
     def params(self) -> list[Field]:
         return [f for f in self.fields.values() if f.param is not None] if self.exported else []
 
+    @property
+    def slots(self) -> list[tuple[str, Field, int | None]]:
+        """Host parameters: one per scalar parameter, one per element of an `Array` parameter, named `x_k`."""
+        return [(f.name if k is None else f"{f.name}_{k}", f, k)
+                for f in self.params for k in (range(f.array[1]) if f.array else [None])]  # fmt: skip
+
     def _collect(self) -> None:
         for index, stmt in enumerate(self.node.body):
             if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
@@ -1372,6 +1422,12 @@ class _KernelModel:
                                 "declare fields as `name: f32 = default`")  # fmt: skip
         if self.cls.__mro__[1] is not Kernel:
             self.errors.add(RuleId.UNSUPPORTED_SYNTAX, "kernel inheritance", self.node, "derive directly from Kernel")
+        for f in self.fields.values():
+            if f.param is not None and f.array is not None:
+                for k in range(f.array[1]):
+                    if f"{f.name}_{k}" in self.fields:
+                        self.errors.add(RuleId.BAD_PARAM, f"field `{f.name}_{k}` has the host name of element {k} "
+                                        f"of parameter `{f.name}`", self.node)  # fmt: skip
         for name, method in self.methods.items():
             if name in _RESERVED_METHODS:
                 self.errors.add(RuleId.BAD_SIGNATURE, f"`{name}` is reserved by the Kernel runtime", method)
@@ -1417,7 +1473,9 @@ class _KernelModel:
         annotation = stmt.annotation
         assert isinstance(annotation, ast.Subscript)
         elts = annotation.slice.elts if isinstance(annotation.slice, ast.Tuple) else []
-        if len(elts) != 2 or stmt.value is not None:
+        default = self.cls.__dict__.get(name)
+        is_param = kind is Array and isinstance(default, Param)
+        if len(elts) != 2 or (stmt.value is not None and not is_param):
             self.errors.add(RuleId.UNSUPPORTED_SYNTAX, f"`{label}` fields are written `{name}: {label}[f32, N]` "
                             "with no default", stmt)  # fmt: skip
             return
@@ -1425,6 +1483,12 @@ class _KernelModel:
         assert isinstance(spec, Spec)
         size = self._buffer_size(kind, spec, elts[1])
         element = elts[0]
+        if is_param:
+            assert isinstance(default, Param)
+            t = self.resolve_scalar(element)
+            if t is not None and size is not None:
+                self._param(stmt, name, t, default, size)
+            return
         if kind is Array and isinstance(element, ast.Name) and element.id in self.program.classes:
             if size is not None:
                 self.fields[name] = Field(name, None, kernel=element.id, count=size)
@@ -1464,7 +1528,8 @@ class _KernelModel:
             return None
         return t, size
 
-    def _param(self, stmt: ast.AnnAssign, name: str, t: str, p: Param) -> None:
+    def _param(self, stmt: ast.AnnAssign, name: str, t: str, p: Param, size: int = 0) -> None:
+        """A scalar parameter, or an `Array` of `size` parameters sharing one range, default and smoothing."""
         values = (p.default, p.lo, p.hi)
         if t != "f32":
             self.errors.add(RuleId.BAD_PARAM, f"parameter `{name}` must be f32, not {t}", stmt)
@@ -1477,8 +1542,8 @@ class _KernelModel:
             self.errors.add(RuleId.BAD_PARAM, f"parameter `{name}`: smooth must be a finite time >= 0 in seconds, "
                             f"got {p.smooth!r}", stmt)  # fmt: skip
         else:
-            self.fields[name] = Field(name, t, float(p.default), param=(float(p.lo), float(p.hi)),
-                                      smooth=float(p.smooth))  # fmt: skip
+            self.fields[name] = Field(name, None if size else t, float(p.default), param=(float(p.lo), float(p.hi)),
+                                      smooth=float(p.smooth), array=(t, size) if size else None)  # fmt: skip
 
 
 def _signature(model: _KernelModel, method: ast.FunctionDef, free: bool = False) -> Signature:
@@ -1836,7 +1901,11 @@ class _Generator:
             structs.append(f"typedef struct {model.cname} {{\n{members}\n}} {model.cname};\n")
         cname = root.cname
         params = root.params
-        setters = "".join(f"void {cname}_set_{p.name}({cname} *self, {sample} value);\n" for p in params)
+        slots = root.slots
+        setters = "".join(
+            f"void {cname}_set_{p.name}({cname} *self, {'int element, ' if p.array else ''}{sample} value);\n"
+            for p in params
+        )
         process_sig = f"void {cname}_process({cname} *self, const {sample} *const *in, {sample} *const *out, int n)"
         init_sig = f"void {cname}_init({cname} *self, {sample} sample_rate)"
         guard = f"CIGNAL_{(self.program.prefix + self.path.stem).upper()}_H"
@@ -1864,7 +1933,7 @@ typedef struct {{
 #endif
 
 {chr(10).join(structs)}
-enum {{ {cname}_N_INPUTS = {n_inputs}, {cname}_N_OUTPUTS = {len(outputs)}, {cname}_N_PARAMS = {len(params)} }};
+enum {{ {cname}_N_INPUTS = {n_inputs}, {cname}_N_OUTPUTS = {len(outputs)}, {cname}_N_PARAMS = {len(slots)} }};
 
 extern const cignal_kernel_info {cname}_info;
 
@@ -1905,7 +1974,7 @@ void {cname}_set_param({cname} *self, int index, {sample} value);
             if key is None or key in self.reachable:
                 source += lines
         source += self._public(root, n_inputs, outputs, init_sig, process_sig)
-        info = [(p.name, *(p.param or (0.0, 0.0)), float(p.default)) for p in params]
+        info = [(n, *(p.param or (0.0, 0.0)), float(p.default)) for n, p, _ in slots]
         return CKernel(name, name_h(self.path), header, "\n".join(source), n_inputs, len(outputs),
                        [(n, lo, hi, d) for n, lo, hi, d in info], sample,
                        frozenset(program.math_symbols), c_name=root.cname)  # fmt: skip
@@ -1937,7 +2006,8 @@ void {cname}_set_param({cname} *self, int index, {sample} value);
             if p.smooth > 0:
                 self.program.math_symbols.add("exp")
                 ctype = target.ctype("f32")
-                init += [f"    self->cignal_target_{p.name} = self->{c_name(p.name)};",
+                loop, k = (f"for (int32_t k = 0; k < {p.array[1]}; k++) ", "[k]") if p.array else ("", "")
+                init += [f"    {loop}self->cignal_target_{p.name}{k} = self->{c_name(p.name)}{k};",
                          f"    self->cignal_coef_{p.name} = ({ctype})(1.0 - exp(-1.0 / ({p.smooth!r} * "
                          "(double)sample_rate)));"]  # fmt: skip
         init += [self._each(f, f"{self._cname(f)}_init(&self->{c_name(f.name)}{{k}}, sample_rate);") for f in subs]
@@ -1978,15 +2048,14 @@ void {cname}_set_param({cname} *self, int index, {sample} value);
         target = self.program.target
         if f.kernel is not None:
             return f"    {self._cname(f)} {c_name(f.name)}{f.c_suffix};"
-        if f.array is not None:
-            return f"    {target.ctype(f.array[0])} {c_name(f.name)}[{f.array[1]}];"
         if f.delay is not None:
             ctype, size = target.ctype(f.delay[0]), f.delay[1]
             return f"    struct {{ {ctype} buf[{size}]; int32_t pos; }} {c_name(f.name)}{f.c_suffix};"
-        member = f"    {target.ctype(f.type or '')} {c_name(f.name)};"
+        ctype = target.ctype(f.array[0] if f.array else f.type or "")
+        suffix = f"[{f.array[1]}]" if f.array else ""
+        member = f"    {ctype} {c_name(f.name)}{suffix};"
         if f.smooth > 0 and self.program.model(self.program.exported or "").fields.get(f.name) is f:
-            ctype = target.ctype(f.type or "")
-            member += f"\n    {ctype} cignal_target_{f.name};\n    {ctype} cignal_coef_{f.name};"
+            member += f"\n    {ctype} cignal_target_{f.name}{suffix};\n    {ctype} cignal_coef_{f.name};"
         return member
 
     def _state(self, model: _KernelModel, keep_params: bool) -> list[str]:
@@ -1996,8 +2065,11 @@ void {cname}_set_param({cname} *self, int index, {sample} value);
         for f in model.fields.values():
             name = f"self->{c_name(f.name)}"
             if f.array is not None:
-                zero = self._literal(False if f.array[0] == "bool" else 0, f.array[0])
-                lines.append(f"    for (int32_t k = 0; k < {f.array[1]}; k++) {name}[k] = {zero};")
+                if keep_params and f.param is not None:
+                    continue
+                fill = f.default if f.param is not None else False if f.array[0] == "bool" else 0
+                lines.append(f"    for (int32_t k = 0; k < {f.array[1]}; k++) {name}[k] = "
+                             f"{self._literal(fill, f.array[0])};")  # fmt: skip
             elif f.delay is not None:
                 ctype = target.ctype(f.delay[0])
                 self.program.helpers.add(f"delay_clear_{ctype}")
@@ -2046,20 +2118,24 @@ void {cname}_set_param({cname} *self, int index, {sample} value);
         snap = self._literal(SMOOTH_SNAP, "f32")
         for p in root.params:
             if p.smooth > 0:  # kernel.smooth_step
+                k = "[k]" if p.array else ""
                 v, target, coef = (
-                    f"self->{c_name(p.name)}",
-                    f"self->cignal_target_{p.name}",
+                    f"self->{c_name(p.name)}{k}",
+                    f"self->cignal_target_{p.name}{k}",
                     f"self->cignal_coef_{p.name}",
                 )
                 # When value == target the full step yields target too (signed zeros included), so the
                 # branch skips the work once a glide has finished.
-                lines += [f"        if ({v} == {target}) {{",
-                          f"            {v} = {target};",
-                          "        } else {",
-                          f"            const {sample} d = {target} - {v};",
-                          f"            const {sample} stepped = {v} + {coef} * d;",
-                          f"            {v} = stepped == {v} || (d > -{snap} && d < {snap}) ? {target} : stepped;",
-                          "        }"]  # fmt: skip
+                step = [f"if ({v} == {target}) {{",
+                        f"    {v} = {target};",
+                        "} else {",
+                        f"    const {sample} d = {target} - {v};",
+                        f"    const {sample} stepped = {v} + {coef} * d;",
+                        f"    {v} = stepped == {v} || (d > -{snap} && d < {snap}) ? {target} : stepped;",
+                        "}"]  # fmt: skip
+                if p.array:
+                    step = [f"for (int32_t k = 0; k < {p.array[1]}; k++) {{", *("    " + s for s in step), "}"]
+                lines += ["        " + s for s in step]
         lines += [f"        const {sample} in{k} = in[{k}][i];" for k in range(n_inputs)]
         if len(outputs) == 1:
             lines.append(f"        out[0][i] = {name}_tick(self{args});")
@@ -2067,30 +2143,37 @@ void {cname}_set_param({cname} *self, int index, {sample} value);
             lines.append(f"        const {self.program.target.ctype(outputs)} r = {name}_tick(self{args});")
             lines += [f"        out[{k}][i] = r.v{k};" for k in range(len(outputs))]
         lines += ["    }", "}", ""]
-        params = root.params
+        slots = root.slots
         lines += [f"void {name}_set_param({name} *self, int index, {sample} value) {{"]
-        if params:
+        if slots:
             lines.append("    switch (index) {")
-            for index, p in enumerate(params):
+            for index, (_, p, element) in enumerate(slots):
                 assert p.param is not None
                 lo, hi = (self._literal(v, "f32") for v in p.param)
                 clamp = f"value < {lo} ? {lo} : (value > {hi} ? {hi} : value)"
                 dest = f"cignal_target_{p.name}" if p.smooth > 0 else c_name(p.name)
+                dest += "" if element is None else f"[{element}]"
                 lines.append(f"    case {index}: self->{dest} = {clamp}; break;")
             lines += ["    default: break;", "    }"]
         else:
             lines += ["    (void)self;", "    (void)index;", "    (void)value;"]
         lines += ["}", ""]
-        for index, p in enumerate(params):
-            lines += [f"void {name}_set_{p.name}({name} *self, {sample} value) {{",
-                      f"    {name}_set_param(self, {index}, value);", "}", ""]  # fmt: skip
+        for index, (_, p, element) in enumerate(slots):
+            if element is None:
+                lines += [f"void {name}_set_{p.name}({name} *self, {sample} value) {{",
+                          f"    {name}_set_param(self, {index}, value);", "}", ""]  # fmt: skip
+            elif element == 0:
+                assert p.array is not None
+                lines += [f"void {name}_set_{p.name}({name} *self, int element, {sample} value) {{",
+                          f"    if (element >= 0 && element < {p.array[1]}) {name}_set_param(self, {index} + element, "
+                          "value);", "}", ""]  # fmt: skip
         table = "NULL"
-        if params:
-            entries = ", ".join(f'{{"{p.name}", {p.param[0]!r}, {p.param[1]!r}, {float(p.default)!r}}}'
-                                for p in params if p.param is not None)  # fmt: skip
+        if slots:
+            entries = ", ".join(f'{{"{n}", {p.param[0]!r}, {p.param[1]!r}, {float(p.default)!r}}}'
+                                for n, p, _ in slots if p.param is not None)  # fmt: skip
             lines += [f"static const cignal_param_info {name}_params[] = {{{entries}}};", ""]
             table = f"{name}_params"
-        fields = f'"{root.name}", {n_inputs}, {len(outputs)}, {len(params)}, {table}, sizeof({name})'
+        fields = f'"{root.name}", {n_inputs}, {len(outputs)}, {len(slots)}, {table}, sizeof({name})'
         lines += [f"const cignal_kernel_info {name}_info = {{{fields}}};", ""]
         return lines
 

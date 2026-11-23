@@ -12,16 +12,17 @@ SIGNALS = signals()
 BLOCK_PATTERNS = ["1", "7", "64", "128", "3,61,64,1", "4800"]
 
 
-def _skip_duplicate_runs(case: Case, signal: str) -> None:
-    if case.info.n_inputs == 0 and signal != "impulse":
-        pytest.skip("a kernel without inputs gives the same output for every signal")
+# A kernel without inputs gives the same output for every signal, so it runs on one.
+CASE_SIGNALS = [
+    pytest.param(case, signal, id=f"{case}-{signal}")
+    for case in CASES
+    for signal in (SIGNALS if case.info.n_inputs else ["impulse"])
+]
 
 
-@pytest.mark.parametrize("signal", SIGNALS)
-@pytest.mark.parametrize("case", CASES, ids=str)
+@pytest.mark.parametrize(("case", "signal"), CASE_SIGNALS)
 def test_double_build_matches_cpython(driver: Driver, case: Case, signal: str) -> None:
     """Bit-identical: same IEEE operations in the same order, same libm, no FMA contraction."""
-    _skip_duplicate_runs(case, signal)
     x = SIGNALS[signal]
     expected = reference(case, x)
     actual = run_driver(driver(case, "double"), case, x, np.float64)
@@ -29,10 +30,8 @@ def test_double_build_matches_cpython(driver: Driver, case: Case, signal: str) -
     assert np.array_equal(actual, expected), float(np.max(np.abs(actual - expected)))
 
 
-@pytest.mark.parametrize("signal", SIGNALS)
-@pytest.mark.parametrize("case", CASES, ids=str)
+@pytest.mark.parametrize(("case", "signal"), CASE_SIGNALS)
 def test_float_build_snr(driver: Driver, case: Case, signal: str) -> None:
-    _skip_duplicate_runs(case, signal)
     x = SIGNALS[signal]
     expected = run_driver(driver(case, "double"), case, x, np.float64)
     actual = run_driver(driver(case, "float"), case, x, np.float32)

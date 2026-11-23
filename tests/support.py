@@ -76,6 +76,17 @@ CASES = [
         ((1000, "cutoff", 4000.0), (2001, "res", 1.1), (2900, "reset", 0.0), (3333, "cutoff", 200.0)),
         min_snr_db=90.0,
     ),
+    Case(
+        "voices.py",
+        "Voices",
+        (
+            (700, "cutoffs_1", 5000.0),
+            (1500, "gains_2", 2.0),
+            (2100, "reset", 0.0),
+            (2800, "cutoffs_3", 50.0),
+            (3500, "gains_0", 0.0),
+        ),
+    ),
     Case("glide.py", "Glide", ((0, "level", 440.0), (2000, "level", 0.0))),
     Case("wavetable.py", "Wavetable", ((1700, "freq", 1234.5), (3100, "reset", 0.0), (3900, "freq", 99.0))),
 ]
