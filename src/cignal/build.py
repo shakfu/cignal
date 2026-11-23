@@ -11,6 +11,7 @@ from pathlib import Path
 from string import Template
 
 from .compiler import CKernel, Target, compile_kernel
+from .headers import PD_HEADERS, SC_HEADERS, headers_dir
 
 STRICT_FLAGS = ("-std=c99", "-O2", "-Wall", "-Wextra", "-Wpedantic", "-Wconversion", "-Wdouble-promotion", "-Werror")
 # Reference builds must not fuse a*b+c, or they stop matching CPython's rounding.
@@ -110,17 +111,18 @@ def pd_extension() -> str:
     return ".pd_darwin" if sys.platform == "darwin" else ".pd_linux"
 
 
-def _mac_pd_apps() -> list[Path]:
-    """Pd bundles in /Applications or one folder below it, newest name first. A recursive glob took 10 s."""
-    apps = [*Path("/Applications").glob("Pd*.app"), *Path("/Applications").glob("*/Pd*.app")]
-    return sorted(apps, reverse=True)
+def _mac_apps(pattern: str) -> list[Path]:
+    """Bundles in /Applications up to two folders below it, newest name first. A recursive glob took 10 s."""
+    root = Path("/Applications")
+    return sorted((app for depth in ("", "*/", "*/*/") for app in root.glob(depth + pattern)), reverse=True)
 
 
 @functools.cache
 def find_pd_include() -> Path | None:
-    """Locate `m_pd.h`: `$PD_INCLUDE`, then standard install locations."""
+    """Locate `m_pd.h`: `$PD_INCLUDE`, then standard install locations, then `cignal fetch-headers`."""
     candidates = [os.environ.get("PD_INCLUDE", ""), "/usr/include/pd", "/usr/local/include/pd"]
-    candidates += [str(app / "Contents/Resources/src") for app in _mac_pd_apps()]
+    candidates += [str(app / "Contents/Resources/src") for app in _mac_apps("Pd*.app")]
+    candidates.append(str(headers_dir(PD_HEADERS)))
     return next((Path(c) for c in candidates if c and (Path(c) / "m_pd.h").is_file()), None)
 
 
@@ -128,7 +130,7 @@ def find_pd_include() -> Path | None:
 def find_pd_binary() -> Path | None:
     """Locate the `pd` executable: `$PD`, then `PATH`, then macOS application bundles."""
     candidates = [os.environ.get("PD", ""), shutil.which("pd") or ""]
-    candidates += [str(app / "Contents/Resources/bin/pd") for app in _mac_pd_apps()]
+    candidates += [str(app / "Contents/Resources/bin/pd") for app in _mac_apps("Pd*.app")]
     return next((Path(c) for c in candidates if c and Path(c).is_file()), None)
 
 
@@ -144,7 +146,7 @@ def build_pd_external(
     """Compile `kernel` as a Pd external. Returns the path of the loadable binary."""
     include = pd_include or find_pd_include()
     if include is None:
-        raise BuildError("m_pd.h not found; set PD_INCLUDE or pass --pd-include")
+        raise BuildError("m_pd.h not found; run `cignal fetch-headers pd`, set PD_INCLUDE or pass --pd-include")
     ck = compiled or compile_kernel(path, kernel)
     _, source = write_kernel(ck, out_dir)
     pd_name = pd_name or pd_object_name(ck)
@@ -163,8 +165,12 @@ def sc_extension() -> str:
 
 @functools.cache
 def find_sc_include() -> Path | None:
-    """Locate the SuperCollider headers (the directory holding `plugin_interface/` and `common/`)."""
+    """Locate the SuperCollider headers (the directory holding `plugin_interface/` and `common/`).
+
+    `$SC_INCLUDE`, then standard install locations, then `cignal fetch-headers`.
+    """
     candidates = [os.environ.get("SC_INCLUDE", ""), "/usr/include/SuperCollider", "/usr/local/include/SuperCollider"]
+    candidates.append(str(headers_dir(SC_HEADERS)))
     return next((Path(c) for c in candidates if c and (Path(c) / "plugin_interface/SC_PlugIn.h").is_file()), None)
 
 
@@ -172,7 +178,7 @@ def find_sc_include() -> Path | None:
 def find_scsynth() -> Path | None:
     """Locate `scsynth`: `$SCSYNTH`, then `PATH`, then the macOS application bundle."""
     candidates = [os.environ.get("SCSYNTH", ""), shutil.which("scsynth") or ""]
-    candidates += [str(p / "Contents/Resources/scsynth") for p in Path("/Applications").glob("SuperCollider*.app")]
+    candidates += [str(app / "Contents/Resources/scsynth") for app in _mac_apps("SuperCollider*.app")]
     return next((Path(c) for c in candidates if c and Path(c).is_file()), None)
 
 
@@ -212,7 +218,9 @@ def build_sc_plugin(
     """
     include = sc_include or find_sc_include()
     if include is None:
-        raise BuildError("SuperCollider headers not found; set SC_INCLUDE or pass --sc-include")
+        raise BuildError(
+            "SuperCollider headers not found; run `cignal fetch-headers sc`, set SC_INCLUDE or pass --sc-include"
+        )
     ck = compiled or compile_kernel(path, kernel)
     _, source = write_kernel(ck, out_dir)
     sc_name = sc_name or sc_ugen_name(ck)

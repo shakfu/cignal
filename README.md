@@ -18,9 +18,11 @@ Status: pre-release. Nothing is published to PyPI yet.
 
 - A C99 compiler (`cc`, or `$CC`). The SuperCollider shim also needs a C++17 compiler (`c++`, or `$CXX`).
 
-- For Pd externals: Pd's `m_pd.h` (found in `/usr/include/pd`, a macOS `Pd*.app`, or `$PD_INCLUDE`).
+- For Pd externals: `m_pd.h`, from `$PD_INCLUDE`, `/usr/include/pd` or a macOS `Pd*.app`.
 
-- For SuperCollider UGens: the SuperCollider plugin headers (`/usr/include/SuperCollider`, or `$SC_INCLUDE`).
+- For SuperCollider UGens: the plugin headers, from `$SC_INCLUDE` or `/usr/include/SuperCollider`. The macOS app does not include them.
+
+- Without either, `cignal fetch-headers` downloads `m_pd.h` from Pd 0.57.0 and the SuperCollider 3.14.1 headers into the user cache, verified against pinned SHA-256 hashes. cignal does not ship them: the SuperCollider headers are GPL-2.0-or-later.
 
 ```sh
 uv sync
@@ -88,6 +90,7 @@ uv run cignal build lowpass.py -o out                # out/lowpass.h, out/lowpas
 uv run cignal build lowpass.py -o out --shim pd      # out/lowpass~.pd_darwin (or .pd_linux)
 uv run cignal build lowpass.py -o out --shim sc      # out/CignalLowpass.so (.scx) and CignalLowpass.sc
 uv run cignal build lowpass.py -o out --prefix fx_   # fx_Lowpass, fx_Section, ...
+uv run cignal fetch-headers                          # or `pd` / `sc`: host headers into the user cache
 ```
 
 A file with several kernels needs `--kernel NAME`, unless only one of them is not a field of another.
@@ -128,7 +131,7 @@ Both shims flush denormals to zero while the kernel runs, and restore the host's
 
 ```sh
 make test                     # pytest; Pd and SuperCollider tests skip when not installed
-make lint type-check
+make qa                       # lint, format and type checks, then tests, as in CI
 make linux-image test-linux   # Debian in an Apple `container` VM: GCC, glibc, Pd 0.55, SuperCollider 3.13
 make linux-image test-linux ARCH=amd64
 make bench
@@ -150,8 +153,10 @@ Each fixture in `tests/fixtures/` is compiled and checked four ways:
 src/cignal/kernel.py       the Python runtime: Kernel, param, Array, Delay, table
 src/cignal/compiler.py     source -> typed walk -> C
 src/cignal/build.py        writing C, rendering shims, invoking the compiler
+src/cignal/headers.py      `cignal fetch-headers`: pinned host header downloads
 src/cignal/shims/          driver, Pd, SuperCollider, benchmark and flush-to-zero templates
 tests/                     fixtures and the differential, host, diagnostics and codegen tests
+thirdparty/                Pd and SuperCollider headers for the tests, not packaged
 bench/                     the benchmark runner and hand-written C references
 ci/linux.Containerfile     the Linux test image
 docs/dev/spec.md           the specification
@@ -159,4 +164,4 @@ docs/dev/spec.md           the specification
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). The headers in `thirdparty/` keep their own licenses: [Pd](thirdparty/pd/LICENSE.txt) (BSD-3-Clause) and [SuperCollider](thirdparty/supercollider/COPYING) (GPL-2.0-or-later).

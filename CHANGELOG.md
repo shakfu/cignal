@@ -4,6 +4,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ## [Unreleased]
 
+### Added
+
+- `cignal fetch-headers [pd] [sc]` downloads `m_pd.h` (Pd 0.57.0) and the SuperCollider 3.14.1 plugin headers into the user cache. Each file is pinned by commit and SHA-256, and a failed fetch installs nothing. The build uses the cache after `$PD_INCLUDE`/`$SC_INCLUDE` and installed copies. The headers are downloaded, not shipped, so the package stays MIT: the SuperCollider headers are GPL-2.0-or-later. The macOS SuperCollider app has no plugin headers, so before this an SC build there needed a source checkout.
+
+- `thirdparty/` holds the same headers for the tests, which fall back to it. It is in neither the wheel nor the sdist.
+
+### Fixed
+
+- `scsynth` and Pd are found in app bundles up to two folders below `/Applications`, such as `/Applications/Studio/supercollider-3.14.1/`.
+
+- SuperCollider tests on macOS. The scsynth plugin path was hard-coded to Linux's `/usr/lib/SuperCollider/plugins`, so `Out` did not load and scsynth rendered silence. The tests also find `sclang` in the same app bundle as `scsynth`.
+
 ## [0.0.1]
 
 First version. Milestones M0 to M5 are in [`docs/dev/spec.md`](docs/dev/spec.md) section 14.

@@ -1,13 +1,21 @@
+import os
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 from support import FIXTURES, Case
 
-from cignal.build import REFERENCE_FLAGS, build_driver
+from cignal.build import REFERENCE_FLAGS, build_driver, find_pd_include, find_sc_include
 from cignal.compiler import Target
 
 Driver = Callable[[Case, str], Path]
+THIRDPARTY = Path(__file__).parents[1] / "thirdparty"
+
+# Fall back to the repository's copy of the host headers. Test modules call the finders at import, after this.
+for finder, var, sub in ((find_pd_include, "PD_INCLUDE", "pd"), (find_sc_include, "SC_INCLUDE", "supercollider")):
+    if finder() is None:
+        os.environ[var] = str(THIRDPARTY / sub)
+        finder.cache_clear()
 
 
 @pytest.fixture(scope="session")

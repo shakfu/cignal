@@ -96,7 +96,9 @@ def render(
     score = [(0, osc_message("/d_recv", data)), (0, osc_message("/s_new", name, NODE, 0, 0)), *events]
     score.append((frames, osc_message("/c_set", 0, 0)))  # the last command's time ends the render
     (work / "score.osc").write_bytes(b"".join(_bundle(f / sample_rate, [m]) for f, m in score))
+    bundled = scsynth.parent / "plugins"  # macOS app bundle; Linux packages use /usr/lib
+    core = bundled if bundled.is_dir() else Path("/usr/lib/SuperCollider/plugins")
     command = [str(scsynth), "-N", "score.osc", str(input_wav) if input_wav else "_", "out.wav", str(sample_rate),
                "WAV", "float", "-i", str(max(n_inputs, 1)), "-o", str(n_outputs),
-               "-U", f"/usr/lib/SuperCollider/plugins:{plugin_dir}"]  # fmt: skip
+               "-U", f"{core}:{plugin_dir}"]  # fmt: skip
     return subprocess.run(command, cwd=work, capture_output=True, text=True, timeout=120)

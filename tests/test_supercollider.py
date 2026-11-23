@@ -58,7 +58,8 @@ def test_sc_ugen_matches_driver(tmp_path: Path, driver: Driver, case: Case) -> N
     assert np.array_equal(actual, expected)
 
 
-SCLANG = shutil.which("sclang")
+_BUNDLED_SCLANG = SCSYNTH.parent.parent / "MacOS/sclang" if SCSYNTH else None  # same app as scsynth
+SCLANG = shutil.which("sclang") or (str(_BUNDLED_SCLANG) if _BUNDLED_SCLANG and _BUNDLED_SCLANG.is_file() else None)
 
 
 @pytest.fixture(scope="module")

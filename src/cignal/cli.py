@@ -1,4 +1,4 @@
-"""Command-line interface: `cignal check` and `cignal build`."""
+"""Command-line interface: `cignal check`, `cignal build` and `cignal fetch-headers`."""
 
 import argparse
 import sys
@@ -7,6 +7,7 @@ from pathlib import Path
 from .build import BuildError, build_driver, build_pd_external, build_sc_plugin, write_kernel
 from .compiler import compile_kernel
 from .diagnostics import CompileError, Diagnostic, diagnostics_to_json
+from .headers import HOSTS, FetchError, fetch
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -29,7 +30,18 @@ def main(argv: list[str] | None = None) -> int:
     build.add_argument("--sc-name", help="SuperCollider UGen name (default: Cignal + kernel name)")
     build.add_argument("--prefix", default="", help="prefix for every generated C identifier, e.g. `mylib_`")
 
+    fetch_headers = commands.add_parser("fetch-headers", help="download host plugin headers into the user cache")
+    fetch_headers.add_argument("hosts", nargs="*", choices=sorted(HOSTS), help="default: all")
+
     args = parser.parse_args(argv)
+    if args.command == "fetch-headers":
+        try:
+            for host in args.hosts or sorted(HOSTS):
+                print(fetch(HOSTS[host]))
+        except FetchError as exc:
+            print(f"cignal: fetch failed: {exc}", file=sys.stderr)
+            return 1
+        return 0
     try:
         if args.command == "check":
             ck = compile_kernel(args.file, args.kernel)
