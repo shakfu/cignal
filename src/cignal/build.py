@@ -10,7 +10,7 @@ from importlib import resources
 from pathlib import Path
 from string import Template
 
-from .compiler import CKernel, Target, compile_kernel
+from .compiler import PD_SELECTORS, CKernel, Target, compile_kernel
 from .headers import PD_HEADERS, SC_HEADERS, headers_dir
 
 STRICT_FLAGS = ("-std=c99", "-O2", "-Wall", "-Wextra", "-Wpedantic", "-Wconversion", "-Wdouble-promotion", "-Werror")
@@ -72,6 +72,12 @@ def render_shim(shim: str, kernel: CKernel, pd_name: str | None = None, sc_name:
         n_params=len(kernel.params),
         n_events=len(kernel.events),
         max_event_args=max([1, *(len(types) for _, types in kernel.events)]),
+        pd_param_msgs="".join(
+            f"    class_addmethod({pd_name.replace('~', '_tilde')}_class, (t_method){pd_name.replace('~', '_tilde')}"
+            f'_param, gensym("{n}"), A_GIMME, 0);\n'
+            for n, *_ in kernel.params
+            if n not in PD_SELECTORS
+        ),
         sc_event_cmds="".join(
             f'    DefineUnitCmd("{sc_name}", "{e}", (UnitCmdFunc)&{sc_name}_event<{k}>);\n'
             for k, (e, _) in enumerate(kernel.events)

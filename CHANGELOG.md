@@ -27,6 +27,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
   Host values convert to `i32` by truncation, saturating, with NaN as 0, since a C cast is undefined there. `event` is a reserved method name, and so are event names Pd uses itself (`bang`, `float`, `reset`, ...).
 
+- A local proves an index when every assignment to it does: `best = i` inside `for i in range(4)` makes `self.voices[best]` valid after the loop. Voice allocation needed this; it was written `self.voices[best % 4]`. The range is the union over all assignments, ignoring control flow, plus 0 for a hoisted declaration.
+
+- Pd: a message `<param> value` on the left inlet sets a parameter, as its inlet does. The 8-voice synth has 19 parameters, so 19 inlets; this lets a patch reach them by name. A parameter named like a Pd selector (`float`, `reset`, ...) keeps only its inlet, and an event with a parameter's name is an error.
+
 ### Changed
 
 - The ABI adds `K_event(k, index, args)` and one `K_on_<name>` per event, and `cignal_kernel_info` ends with `n_events` and `events`.

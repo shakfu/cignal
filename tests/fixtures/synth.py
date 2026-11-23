@@ -64,8 +64,7 @@ class Synth(Kernel):
 
     @event
     def on_note(self, note: i32, velocity: f32) -> None:
-        # The voice already playing this note, else the longest-free voice, else the oldest. `% 4`
-        # proves the index: the range check does not follow `pick = i` out of the loop.
+        # The voice already playing this note, else the longest-free voice, else the oldest.
         pick = 0
         best = -1
         for i in range(4):
@@ -78,7 +77,7 @@ class Synth(Kernel):
             if score > best:
                 best = score
                 pick = i
-        self.voices[pick % 4].start(note, 440.0 * 2.0 ** (f64(note - 69) / 12.0), velocity)
+        self.voices[pick].start(note, 440.0 * 2.0 ** (f64(note - 69) / 12.0), velocity)
 
     @event
     def on_off(self, note: i32) -> None:

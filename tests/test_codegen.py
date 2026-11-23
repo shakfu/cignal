@@ -292,3 +292,26 @@ def test_events_are_public_functions_with_a_dispatcher_on_the_exported_kernel_on
     assert "void K_event(K *self, int index, const float *args);" in kernel.header
     assert "case 0: K_on_note(self, cignal_event_i32((double)args[0]), args[1]); break;" in kernel.source
     assert "static inline void S_on_bump(S *self)" in kernel.source
+
+
+def test_a_local_assigned_only_proven_values_proves_an_index(tmp_path: Path) -> None:
+    path = tmp_path / "k.py"
+    path.write_text(
+        textwrap.dedent("""
+        from cignal import Array, Kernel, f32, i32
+
+        class K(Kernel):
+            a: Array[f32, 4]
+            b: Array[f32, 5]
+
+            def tick(self, x: f32) -> f32:
+                best: i32 = 0
+                for i in range(4):
+                    if self.a[i] > self.a[best]:
+                        best = i
+                after = best + 1  # depends on another inferred local
+                self.a[best] = x
+                return self.b[after]
+    """)
+    )
+    assert "return self->b[after];" in compile_kernel(path).source

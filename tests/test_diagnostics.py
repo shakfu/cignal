@@ -76,6 +76,23 @@ CASES = [
     (RuleId.UNPROVEN_INDEX, kernel("a: Array[f32, 4]", tick="for i in range(5):\n    x += self.a[i]\nreturn x"), 8),
     (RuleId.UNPROVEN_INDEX, kernel("a: Array[f32, 4]", tick="return self.a[i32(x) % 4]"), 7),
     (RuleId.UNSUPPORTED_SYNTAX, kernel(tick="for i in range(4):\n    i = 2\nreturn x"), 7),
+    # A local proves an index only if every assignment does; each of these has one that does not.
+    (
+        RuleId.UNPROVEN_INDEX,
+        kernel("a: Array[f32, 4]", tick="k = 0\nfor i in range(4):\n    k = k + 1\nreturn self.a[k]"),
+        10,
+    ),
+    (RuleId.UNPROVEN_INDEX, kernel("a: Array[f32, 4]\nn: i32 = 0", tick="k = self.n\nreturn self.a[k]"), 9),
+    (RuleId.UNPROVEN_INDEX, kernel("a: Array[f32, 4]", tick="k = 0\nk += 1\nreturn self.a[k]"), 9),
+    (RuleId.UNPROVEN_INDEX, kernel("a: Array[f32, 4]", tick="k = 0\nif x > 0.0:\n    k = 4\nreturn self.a[k]"), 10),
+    (
+        RuleId.UNPROVEN_INDEX,
+        # The local `N` shadows the module constant in the loop bound.
+        HEADER
+        + "N = 2\n"
+        + kernel("a: Array[f32, 4]", tick="N = i32(x)\nfor i in range(N):\n    k = i\nreturn self.a[k]")[len(HEADER) :],
+        11,
+    ),
     (RuleId.CONSTANT_RANGE, kernel("d: Delay[f32, 1]"), 5),
     (RuleId.UNKNOWN_TYPE, kernel("d: Delay[i32, 8]"), 5),
     (RuleId.TYPE_MISMATCH, kernel("d: Delay[f32, 8]", tick="return self.d"), 7),
@@ -121,6 +138,7 @@ CASES = [
     (RuleId.BAD_SIGNATURE, kernel("@event\ndef on_reset(self) -> None:\n    pass"), 6),
     (RuleId.BAD_SIGNATURE, kernel("@event\ndef on_x(self) -> f32:\n    return 1.0"), 6),
     (RuleId.BAD_SIGNATURE, kernel("def event(self) -> None:\n    pass"), 5),
+    (RuleId.BAD_SIGNATURE, kernel("g: f32 = param(1.0, lo=0.0, hi=2.0)\n@event\ndef on_g(self) -> None:\n    pass"), 7),
     (RuleId.UNSUPPORTED_SYNTAX, kernel("@staticmethod\ndef f(self) -> None:\n    pass"), 5),
     (RuleId.UNSUPPORTED_SYNTAX, kernel("n: i32 = 2", tick="return x + f32(self.n ** self.n)"), 7),
     (RuleId.UNSUPPORTED_SYNTAX, kernel("n: i32 = 2", tick="return x + f32(self.n ** -1)"), 7),

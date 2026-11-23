@@ -36,7 +36,7 @@ Design questions are argued in [`docs/dev/spec.md`](docs/dev/spec.md) section 13
 
 - [ ] **Hand-written glides repeat the snap rule.** The ladder experiment copied `smooth_step`'s snap to avoid a float stall; the synth no longer does. Open for glides inside a sub-kernel, which has no parameters. Option: a built-in `glide(value, target, coef)`, or `smooth=` on plain fields.
 
-- [ ] **Pd inlet count.** 19 parameters give 19 inlets. Option: a `name value` message on the left inlet (`freqs_3 440`); a shim-only change.
+- [x] **Pd inlet count.** 19 parameters give 19 inlets. A `name value` message on the left inlet now sets any of them (`freqs_3 440`).
 
 - [ ] **A sub-kernel's `tick` must take `f32` samples**, even when only its parent calls it. The voice method is `play` to take an `f64` pitch. Minor: the rule could apply only to the exported kernel.
 
@@ -44,7 +44,7 @@ Design questions are argued in [`docs/dev/spec.md`](docs/dev/spec.md) section 13
 
 ### Found by writing the event synth (2026-11-23)
 
-- [ ] **Index proofs do not follow assignments out of a loop.** `pick = i` inside `for i in range(4)` leaves `pick` unproven, so the fixture writes `self.voices[pick % 4]`. Option: track the range of a local assigned only from proven values.
+- [x] **Index proofs do not follow assignments out of a loop.** A local assigned only proven values now proves an index (spec 5.4).
 
 - [ ] **SuperCollider events see last block's parameters.** Inputs are read in the calculation function, after the unit command. Pd applies pending inlets first. Only matters for an event that reads a parameter set in the same block.
 

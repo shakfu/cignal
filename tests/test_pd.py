@@ -78,9 +78,12 @@ def test_pd_flushes_denormals(tmp_path: Path) -> None:
     assert np.count_nonzero(y) == 0, f"denormals were not flushed: output {y[0, :3]}"
 
 
+@pytest.mark.parametrize("via", ["inlet", "message"])
 @pytest.mark.parametrize("case", [c for c in CASES if c.changes], ids=str)
-def test_pd_changes_mid_stream_match_driver(tmp_path: Path, driver: Driver, case: Case) -> None:
+def test_pd_changes_mid_stream_match_driver(tmp_path: Path, driver: Driver, case: Case, via: str) -> None:
     """Parameter changes, resets and events sent while DSP runs, moved to the start of their 64-sample block.
+
+    Parameters go to their inlets, or as `<param> value` messages to the left inlet.
 
     Pd reads `nan` in a message as a symbol, which `atom_getfloat` makes 0, so the driver gets 0 there too.
     """
@@ -99,6 +102,8 @@ def test_pd_changes_mid_stream_match_driver(tmp_path: Path, driver: Driver, case
         else (frame, 0, "reset")
         if param == "reset"
         else (frame, case.param_index(param) + info.n_inputs, repr(value))
+        if via == "inlet"
+        else (frame, 0, f"{param} {value!r}")
         for frame, param, value in changes
     )
     signal = inputs(case, x) if info.n_inputs else np.zeros((1, FRAMES))

@@ -121,7 +121,7 @@ uv run cignal fetch-headers                          # or `pd` / `sc`: host head
 
 A file with several kernels needs `--kernel NAME`, unless only one of them is not a field of another.
 
-- **Pd.** Inlets are the signal inputs, then one float inlet per parameter. Creation arguments set the parameters in order, and a `reset` message clears state. Events are messages on the left inlet: `note 60 0.8`. Pick a name that is not a Pd built-in with `--pd-name`: `biquad~` would load Pd's own object, without an error.
+- **Pd.** Inlets are the signal inputs, then one float inlet per parameter. Creation arguments set the parameters in order, and a `reset` message clears state. `cutoff 800` on the left inlet sets a parameter, and events are messages there too: `note 60 0.8`. Pick a name that is not a Pd built-in with `--pd-name`: `biquad~` would load Pd's own object, without an error.
 
 - **SuperCollider.** Copy the plugin and the `.sc` class file into an extensions folder. UGen inputs are the signal inputs, then one input per parameter: `CignalLowpass.ar(sig, 800, 2)`. Parameters are read once per block. `/u_cmd node ugen "reset"` clears state, and `/u_cmd node ugen "note" 60 0.8` sends an event.
 
@@ -137,7 +137,7 @@ Both shims flush denormals to zero while the kernel runs, and restore the host's
 
 - **Sizes are build-time constants.** `Array[f32, 16]`, `Delay[f32, MAX]`, `Array[Comb, 8]` of sub-kernels, `@table(size=512, ...)`. Module-level constants and `math` expressions on them are folded in CPython.
 
-- **Array indices must be provably in range.** Use a constant, a `range` loop variable with constant bounds, or `e % N`. Anything else is a compile error, and there are no runtime bounds checks.
+- **Array indices must be provably in range.** Use a constant, a `range` loop variable with constant bounds, `e % N`, or a local assigned only those, such as `best = i` in a loop. Anything else is a compile error, and there are no runtime bounds checks.
 
 - **`Delay.read(d)` counts from 1.** `read(1)` is the newest sample, so `read(D)` before `write(x)` delays by exactly D samples.
 

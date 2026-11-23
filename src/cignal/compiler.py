@@ -41,8 +41,9 @@ _MATH_CONSTANTS = {"pi": math.pi, "tau": math.tau, "e": math.e}
 _CASTS = {"f32": float, "f64": float, "i32": int}
 _LIFECYCLE = ("init", "control", "tick")
 _RESERVED_METHODS = ("process", "set_param", "reset", "target", "event")
-# Event names the Pd shim cannot take: Pd's built-in selectors and the shim's own methods.
-_RESERVED_EVENTS = frozenset({"anything", "bang", "dsp", "float", "list", "pointer", "reset", "signal", "symbol"})
+# Pd's built-in selectors and the Pd shim's own methods: no event may take these names, and no parameter
+# with one gets a `<name> value` message.
+PD_SELECTORS = frozenset({"anything", "bang", "dsp", "float", "list", "pointer", "reset", "signal", "symbol"})
 
 
 def _py_mod(a: Number, b: Number) -> Number:
@@ -456,12 +457,15 @@ class _FunctionLowerer:
         self.temps = itertools.count()
         # Live `for` variables and their proven value range (None when the bounds are not constant).
         self.loop_vars: dict[str, tuple[int, int] | None] = {}
+        self.local_ranges: dict[str, tuple[int, int]] = {}  # locals every assignment keeps in a proven range
+        self.assigned: set[str] = set()  # names the body assigns: never module constants, even before declared
         self.helpers: set[str] = set()  # emitted only if this function is
         self.smoothed_reads: list[ast.AST] = []  # reads of smoothed parameters, which `control` may not do
 
     # -- statements -------------------------------------------------------
 
     def lower_body(self, body: list[ast.stmt]) -> list[str]:
+        self.local_ranges = self._infer_local_ranges(body)
         self._block(body, 1)
         # A local first assigned inside a branch is hoisted, so every later read sees a declaration.
         decls = [
@@ -888,7 +892,8 @@ class _FunctionLowerer:
             found = "unknown" if bounds is None else f"[{bounds[0]}, {bounds[1]}]"
             self.errors.add(RuleId.UNPROVEN_INDEX, f"index `{ast.unparse(node)}` is not provably in "
                             f"[0, {size - 1}] (found {found})", node,
-                            f"use a constant, a `range` variable with constant bounds, or `e % {size}`")  # fmt: skip
+                            f"use a constant, a `range` variable with constant bounds, `e % {size}`, or a local "
+                            "assigned only such values")  # fmt: skip
             raise _Abort
         return code
 
@@ -910,30 +915,99 @@ class _FunctionLowerer:
         self.helpers.add(f"const_{name}")
         return _Expr(f"cignal_const_{name}[{code}]", t)
 
-    def _index_range(self, node: ast.expr) -> tuple[int, int] | None:
-        """The interval an i32 index expression is proven to lie in, or None."""
+    def _infer_local_ranges(self, body: list[ast.stmt]) -> dict[str, tuple[int, int]]:
+        """Ranges of locals whose every assignment is provably in range, so `pick = i` can index after the loop.
+
+        Flow-insensitive: a local's range is the union over all its assignments, plus 0, the value of a hoisted
+        declaration. A local assigned any other way, or in a cycle (`k = k + 1`), gets no range.
+        """
+        self.assigned = {n.id for stmt in body for n in ast.walk(stmt) if isinstance(n, ast.Name)
+                         and isinstance(n.ctx, ast.Store)}  # fmt: skip
+        sites: dict[str, list[tuple[ast.expr | None, dict[str, tuple[int, int] | None]]]] = {}
+        unknown: set[str] = set()
+
+        def visit(stmts: list[ast.stmt], loops: dict[str, tuple[int, int] | None]) -> None:
+            for stmt in stmts:
+                if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                    sites.setdefault(stmt.targets[0].id, []).append((stmt.value, loops))
+                elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                    sites.setdefault(stmt.target.id, []).append((stmt.value, loops))
+                elif isinstance(stmt, (ast.Assign, ast.AugAssign)):
+                    unknown.update(n.id for n in ast.walk(stmt) if isinstance(n, ast.Name)
+                                   and isinstance(n.ctx, ast.Store))  # fmt: skip
+                if isinstance(stmt, ast.For) and isinstance(stmt.target, ast.Name):
+                    visit(stmt.body, {**loops, stmt.target.id: self._range_bounds(stmt.iter)})
+                elif isinstance(stmt, (ast.If, ast.While)):
+                    visit(stmt.body, loops)
+                    visit(stmt.orelse, loops)
+
+        visit(body, {})
+        candidates = {n: s for n, s in sites.items() if n not in unknown and n not in self.params}
+        ranges: dict[str, tuple[int, int]] = {}
+        saved = self.loop_vars, self.local_ranges
+        try:
+            for _ in range(len(candidates) + 1):  # each pass settles at least one more local, or none ever will
+                found: dict[str, tuple[int, int]] = {}
+                for name, assigned in candidates.items():
+                    lo, hi = 0, 0
+                    for value, loops in assigned:
+                        self.loop_vars, self.local_ranges = loops, ranges
+                        r = (0, 0) if value is None else self._index_range(value, locals_known=True)
+                        if r is None:
+                            break
+                        lo, hi = min(lo, r[0]), max(hi, r[1])
+                    else:
+                        found[name] = (lo, hi)
+                if found == ranges:
+                    break
+                ranges = found
+        finally:
+            self.loop_vars, self.local_ranges = saved
+        return ranges
+
+    def _range_bounds(self, call: ast.expr) -> tuple[int, int] | None:
+        """The values of `range(...)` with constant arguments, as `_for` proves them."""
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "range"):
+            return None
+        points = [self._index_range(a, locals_known=True) for a in call.args]
+        if not 1 <= len(points) <= 3 or any(p is None or p[0] != p[1] for p in points):
+            return None
+        args = [p[0] for p in points if p is not None]
+        if len(args) == 3 and args[2] == 0:
+            return None
+        values = range(*args)
+        return (min(values), max(values)) if values else (0, 0)
+
+    def _index_range(self, node: ast.expr, locals_known: bool = False) -> tuple[int, int] | None:
+        """The interval an i32 index expression is proven to lie in, or None.
+
+        `locals_known` applies `local_ranges` before the locals are declared, while they are inferred.
+        """
         if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
             return node.value, node.value
         if isinstance(node, ast.Name):
             if node.id in self.loop_vars:
                 return self.loop_vars[node.id]
-            if node.id in self.params or node.id in self.locals:
+            if node.id in self.local_ranges and (locals_known or node.id in self.locals):
+                return self.local_ranges[node.id]
+            if node.id in self.params or node.id in self.locals or (locals_known and node.id in self.assigned):
                 return None  # a runtime value, even if a module constant has the same name
             value = self.kernel.constant(node.id)
             if isinstance(value, int) and not isinstance(value, bool):
                 return value, value
             return None
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
-            inner = self._index_range(node.operand)
+            inner = self._index_range(node.operand, locals_known)
             return (-inner[1], -inner[0]) if inner else None
         if isinstance(node, ast.BinOp):
             if isinstance(node.op, ast.Mod):
-                right = self._index_range(node.right)
+                right = self._index_range(node.right, locals_known)
                 # Floor-mod by a positive constant lands in [0, M - 1] whatever the left operand.
                 return (0, right[0] - 1) if right and right[0] == right[1] and right[0] > 0 else None
-            left, right = self._index_range(node.left), self._index_range(node.right)
+            left, right = self._index_range(node.left, locals_known), self._index_range(node.right, locals_known)
             if left is None or right is None:
                 return None
+            # Add and Sub are exact mod 2**32, so a range inside [0, size) holds under C's wrapping too.
             if isinstance(node.op, ast.Add):
                 return left[0] + right[0], left[1] + right[1]
             if isinstance(node.op, ast.Sub):
@@ -1590,9 +1664,9 @@ def _signature(model: _KernelModel, method: ast.FunctionDef, free: bool = False)
                        "or rename it without the `on_` prefix")  # fmt: skip
         elif not name.startswith("on_") or name == "on_":
             errors.add(RuleId.BAD_SIGNATURE, f"event method `{name}` must be named `on_<event>`", method)
-        elif name[3:] in _RESERVED_EVENTS:
+        elif name[3:] in PD_SELECTORS:
             errors.add(RuleId.BAD_SIGNATURE, f"event `{name[3:]}` is reserved by a host", method,
-                       f"reserved: {', '.join(sorted(_RESERVED_EVENTS))}")  # fmt: skip
+                       f"reserved: {', '.join(sorted(PD_SELECTORS))}")  # fmt: skip
         if returns is not None:
             errors.add(RuleId.BAD_SIGNATURE, f"event `{name}` must return None", method)
         return Signature(params, returns, method, event=bool(marked))
@@ -1921,6 +1995,10 @@ class _Generator:
             self._kernel_functions(model)
         program.check_recursion()
         events = [(m[3:], s) for m, s in root.signatures.items() if s.event]
+        for e, s in events:
+            if e in {n for n, _, _ in root.slots}:
+                program.errors.add(RuleId.BAD_SIGNATURE, f"event `{e}` has the host name of a parameter", s.node,
+                                   "Pd sends both as `<name> args...`; rename one")  # fmt: skip
         roots = {(name, "tick"), (name, "control"), *((m.name, "init") for m in models)}
         self.reachable = self._reachable(roots | {(name, f"on_{e}") for e, _ in events})
         for caller in sorted(self._reachable({(name, "control")})):
@@ -2272,4 +2350,4 @@ def name_h(path: Path) -> str:
     return f"{path.stem}.h"
 
 
-__all__ = ["CKernel", "Field", "Target", "c_name", "compile_kernel"]
+__all__ = ["PD_SELECTORS", "CKernel", "Field", "Target", "c_name", "compile_kernel"]

@@ -267,7 +267,7 @@ class Kernel:
     def event(self, name: str, *args: float) -> None:
         """Deliver event `name` (method `on_<name>`), converting each host value to the argument's type."""
         method = getattr(type(self), f"on_{name}", None)
-        if not getattr(method, "_cignal_event", False):
+        if not callable(method) or not getattr(method, "_cignal_event", False):
             raise KeyError(f"{type(self).__name__} has no event {name!r}")
         types = [t for k, t in inspect.get_annotations(method, eval_str=True).items() if k != "return"]
         if len(args) != len(types):
