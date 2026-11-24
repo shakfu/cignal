@@ -6,7 +6,7 @@ Each case applies its parameter changes mid-stream, so these also test `set_para
 import numpy as np
 import pytest
 from conftest import Driver
-from support import CASES, Case, reference, run_driver, signals, snr_db
+from support import CASES, SAMPLE_RATE, Case, Change, reference, run_driver, signals, snr_db
 
 SIGNALS = signals()
 BLOCK_PATTERNS = ["1", "7", "64", "128", "3,61,64,1", "4800"]
@@ -36,6 +36,41 @@ def test_float_build_snr(driver: Driver, case: Case, signal: str) -> None:
     expected = run_driver(driver(case, "double"), case, x, np.float64)
     actual = run_driver(driver(case, "float"), case, x, np.float32)
     assert snr_db(expected, actual) >= case.min_snr_db
+
+
+TAIL_CASES = [c for c in CASES if c.tail_s > 0]
+
+
+def tail_run(case: Case) -> tuple[np.ndarray, tuple[Change, ...]]:
+    """A 0.5 s burst then silence, `case.tail_s` long, and every parameter set to its float32-rounded
+    default at frame 0. Unrounded, a default like Echo's `time = 0.05` differs between builds by input."""
+    rng = np.random.default_rng(1234)
+    x = np.zeros(int(case.tail_s * SAMPLE_RATE))
+    x[: SAMPLE_RATE // 2] = 0.5 * rng.uniform(-1, 1, SAMPLE_RATE // 2)
+    defaults = tuple((0, name, float(np.float32(default))) for name, _, _, default in case.info.params)
+    return x.astype(np.float32).astype(np.float64), defaults
+
+
+@pytest.mark.parametrize("case", TAIL_CASES, ids=str)
+def test_double_build_matches_cpython_long_tail(driver: Driver, case: Case) -> None:
+    """Past FRAMES, so delay lines longer than FRAMES wrap; the float-vs-double test alone would pass a
+    wrap bug both builds share."""
+    x, changes = tail_run(case)
+    expected = reference(case, x, changes)
+    actual = run_driver(driver(case, "double"), case, x, np.float64, changes=changes)
+    assert np.array_equal(actual, expected), float(np.max(np.abs(actual - expected)))
+
+
+@pytest.mark.parametrize("case", TAIL_CASES, ids=str)
+def test_float_build_snr_long_tail(driver: Driver, case: Case) -> None:
+    """Every 1 s window meets the case threshold. Coefficient error compounds per pass through feedback:
+    an f32 decay rate held Gigaverb above 100 dB over FRAMES but at 37.5 dB in its 10th second."""
+    x, changes = tail_run(case)
+    expected = run_driver(driver(case, "double"), case, x, np.float64, changes=changes)
+    actual = run_driver(driver(case, "float"), case, x, np.float32, changes=changes)
+    windows = range(0, len(x), SAMPLE_RATE)
+    snrs = [snr_db(expected[:, i : i + SAMPLE_RATE], actual[:, i : i + SAMPLE_RATE]) for i in windows]
+    assert min(snrs) >= case.min_snr_db, [round(s, 1) for s in snrs]
 
 
 @pytest.mark.parametrize("case", CASES, ids=str)

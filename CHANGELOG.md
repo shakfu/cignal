@@ -4,11 +4,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ## [Unreleased]
 
+## [0.1.0]
+
 ### Added
 
 - Module-level tuples can be indexed, as spec 3.5 already stated: a constant index folds, and any other index is proven in range like an `Array` index and reads a `static const` array. The element type is `i32` when every element is an int, so `COMBS[i]` keeps its integer meaning; one float makes the tuple `f32`.
 
 - `Array[K, N]` of sub-kernels and `Array[Delay[T, M], N]` of delay lines, used through a proven index: `self.combs[i].tick(x)`. A file whose kernels are held only through such arrays no longer reports "several top-level kernels".
+
+- Gigaverb fixture, and long-tail tests for cases with `Case.tail_s` set (spec 9.1). Over 10 s, Gigaverb's float build measured 68 dB, because its decay rate was computed in `f32`. The 4800-frame test had passed above 100 dB, and never wrapped its delay lines.
 
 - Freeverb, Moog-ladder and 8-voice synth fixtures, written to find what a real kernel needs; the items above came from them, and the synth's gaps are in `TODO.md`. The float-build SNR threshold is now per case: the ladder self-oscillates at `res=1.1`, where the builds drift in phase, and passes at 90 dB (spec 9.1).
 

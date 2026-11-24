@@ -1,6 +1,6 @@
 [project]
 name = "cignal"
-version = "0.0.2"
+version = "0.1.0"
 description = "Compile DSP kernels written in static Python to C99"
 readme = "README.md"
 license = "MIT"

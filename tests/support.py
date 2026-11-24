@@ -36,6 +36,9 @@ class Case:
     changes: tuple[Change, ...] = ()
     # The float build's SNR against the double build (spec 9.1). Lower only for a measured reason.
     min_snr_db: float = 100.0
+    # Seconds of the long-tail test (spec 9.1): a 0.5 s burst, then silence. 0 skips it. Use it for
+    # feedback kernels, where coefficient error compounds past FRAMES, or delays longer than FRAMES.
+    tail_s: float = 0.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "changes", tuple((f, n, _f32(v)) for f, n, v in self.changes))
@@ -61,8 +64,12 @@ CASES = [
     Case("lowpass.py", "Lowpass", ((1000, "cutoff", 3000.0), (3001, "q", 4.0), (4000, "cutoff", 1e6))),
     Case("saw.py", "Saw", ((1200, "freq", 1000.0), (2500, "freq", -5.0), (3100, "freq", 220.5))),
     Case("stereo.py", "Stereo", ((700, "balance", -0.5), (2000, "gain", 2.5), (3333, "balance", 7.0))),
+    # 2 s: the echo decays 6 dB per 50 ms and leaves the float range after about 7.5 s.
     Case(
-        "echo.py", "Echo", ((900, "time", 0.0333), (2000, "feedback", 0.9), (2600, "reset", 0.0), (3500, "time", 1.0))
+        "echo.py",
+        "Echo",
+        ((900, "time", 0.0333), (2000, "feedback", 0.9), (2600, "reset", 0.0), (3500, "time", 1.0)),
+        tail_s=2.0,
     ),
     Case(
         "comb.py", "Comb", ((1100, "delay", 337.6), (2222, "damp", 0.6), (3000, "reset", 0.0), (3001, "feedback", -0.8))
@@ -77,6 +84,22 @@ CASES = [
         "freeverb.py",
         "Freeverb",
         ((900, "room", 0.95), (2200, "reset", 0.0), (2500, "damp", 0.1), (3700, "wet", 2.0)),
+        tail_s=10.0,
+    ),
+    # Room 10 m puts the first FDN return at frame 1412, inside the 4800-frame run; 30 m moves it past.
+    Case(
+        "gigaverb.py",
+        "Gigaverb",
+        (
+            (800, "spread", 80.0),
+            (1700, "roomsize", 30.0),
+            (2300, "damping", 0.1),
+            (2900, "reset", 0.0),
+            (3100, "roomsize", 3.0),
+            (3500, "revtime", 1.0),
+            (4000, "bandwidth", 2.0),
+        ),
+        tail_s=10.0,
     ),
     # Self-oscillating at res=1.1, the float build drifts in phase: 96.1 dB on silence_burst (spec 9.1).
     Case(
