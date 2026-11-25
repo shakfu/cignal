@@ -68,5 +68,5 @@ B. A fixes only the first problem. B fixes all three, and its ABI addition copie
 
 ## Not proposed
 
-- **MIDI in the ABI.** Fixed `note_on`/`note_off` signatures would fit fewer kernels. A shim can map MIDI to event methods by name later.
+- **MIDI in the ABI.** Fixed `note_on`/`note_off` signatures would fit fewer kernels. A shim can map MIDI to event methods by name; gen-dsp maps note-on and note-off to `note(pitch, velocity)` and `off(pitch)`.
 - **Event queues inside `process`.** Sample-accurate timing already comes from splitting blocks.

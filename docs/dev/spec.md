@@ -291,6 +291,8 @@ ABI rules:
 - **The ABI is single-threaded**: one thread per kernel instance at a time.
 - **The header has an `extern "C"` guard**, so C++ hosts link against the C symbols. The `.c` file is compiled as C, not C++: it uses compound literals, which C++ lacks.
 
+`cignal build --manifest` also writes `<stem>.cignal.json`: the file names, `c_name`, sample type, I/O counts, parameters (`name`, `lo`, `hi`, `default`) and events (`name`, `args`). It lets a tool generate a wrapper without importing cignal or parsing C. gen-dsp reads it to build AU, CLAP, LV2, SuperCollider and VST3 plugins, and maps MIDI notes to events named `note(pitch, velocity)` and `off(pitch)`. A change that breaks a reader bumps its `format` field, now 1. The alternative, reading `K_info` at run time, gives the tool nothing at generation time, when plugin formats such as LV2 need parameter names.
+
 ## 7. Generated code quality
 
 Every generated file must compile cleanly with `-std=c99 -Wall -Wextra -Wpedantic -Wconversion -Wdouble-promotion -Werror` on Clang and GCC. `-Wdouble-promotion` catches accidental `double` maths in an `f32` kernel.

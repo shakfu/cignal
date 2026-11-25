@@ -1,6 +1,7 @@
 """Write generated C, render host shims, and invoke the C compiler."""
 
 import functools
+import json
 import os
 import shutil
 import subprocess
@@ -16,6 +17,8 @@ from .headers import PD_HEADERS, SC_HEADERS, headers_dir
 STRICT_FLAGS = ("-std=c99", "-O2", "-Wall", "-Wextra", "-Wpedantic", "-Wconversion", "-Wdouble-promotion", "-Werror")
 # Reference builds must not fuse a*b+c, or they stop matching CPython's rounding.
 REFERENCE_FLAGS = ("-ffp-contract=off",)
+# Bumped on any incompatible change to `kernel_manifest`.
+MANIFEST_FORMAT = 1
 
 
 class BuildError(Exception):
@@ -38,6 +41,32 @@ def write_kernel(kernel: CKernel, out_dir: Path) -> tuple[Path, Path]:
     header.write_text(kernel.header)
     source.write_text(kernel.source)
     return header, source
+
+
+def kernel_manifest(kernel: CKernel) -> str:
+    """JSON describing the kernel's C API, for tools that wrap it without importing cignal (spec 6)."""
+    header = Path(kernel.header_name)
+    data = {
+        "format": MANIFEST_FORMAT,
+        "name": kernel.name,
+        "c_name": kernel.c_name,
+        "header": header.name,
+        "source": header.with_suffix(".c").name,
+        "sample_type": kernel.sample_ctype,
+        "n_inputs": kernel.n_inputs,
+        "n_outputs": kernel.n_outputs,
+        "params": [{"name": n, "lo": lo, "hi": hi, "default": d} for n, lo, hi, d in kernel.params],
+        "events": [{"name": n, "args": list(args)} for n, args in kernel.events],
+    }
+    return json.dumps(data, indent=2) + "\n"
+
+
+def write_manifest(kernel: CKernel, out_dir: Path) -> Path:
+    """Write `kernel_manifest` next to the header, as `<stem>.cignal.json`."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / (Path(kernel.header_name).stem + ".cignal.json")
+    path.write_text(kernel_manifest(kernel))
+    return path
 
 
 def pd_object_name(kernel: CKernel) -> str:

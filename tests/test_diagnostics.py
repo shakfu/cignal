@@ -238,3 +238,18 @@ def test_check_cli_accepts_fixture() -> None:
 def test_build_cli_writes_header_and_source(tmp_path: Path) -> None:
     assert main(["build", str(FIXTURES / "biquad.py"), "-o", str(tmp_path)]) == 0
     assert (tmp_path / "biquad.h").is_file() and (tmp_path / "biquad.c").is_file()
+
+
+def test_build_cli_writes_manifest(tmp_path: Path) -> None:
+    """The manifest names the files written beside it and the C symbols the header declares."""
+    assert main(["build", str(FIXTURES / "synth.py"), "-o", str(tmp_path), "--prefix", "fx_", "--manifest"]) == 0
+    ck = compile_kernel(FIXTURES / "synth.py", prefix="fx_")
+    data = json.loads((tmp_path / "synth.cignal.json").read_text())
+    assert data["format"] == 1
+    assert (data["name"], data["c_name"], data["sample_type"]) == ("Synth", "fx_Synth", "float")
+    assert (tmp_path / data["header"]).is_file() and (tmp_path / data["source"]).is_file()
+    assert (data["n_inputs"], data["n_outputs"]) == (ck.n_inputs, ck.n_outputs)
+    assert [(p["name"], p["lo"], p["hi"], p["default"]) for p in data["params"]] == [tuple(p) for p in ck.params]
+    assert [(e["name"], tuple(e["args"])) for e in data["events"]] == ck.events
+    header = (tmp_path / data["header"]).read_text()
+    assert f"void {data['c_name']}_process(" in header and f"{data['c_name']}_info;" in header
