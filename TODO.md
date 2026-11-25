@@ -48,15 +48,15 @@ Design questions are argued in [`docs/dev/spec.md`](docs/dev/spec.md) section 13
 
 - [ ] **SuperCollider events see last block's parameters.** Inputs are read in the calculation function, after the unit command. Pd applies pending inlets first. Only matters for an event that reads a parameter set in the same block.
 
-- [ ] **clang rewrites `pow(2.0, x)` as `exp2(x)`.** CPython calls `pow`. The double build still matched CPython bit for bit on macOS; unverified on glibc until CI runs.
+- [x] **clang rewrites `pow(2.0, x)` as `exp2(x)`.** CPython calls `pow`. The synth fixture's `2.0 ** x` matches CPython bit for bit on macOS and on glibc (GCC, arm64 and x86-64, 2026-11-25).
 
 ## Medium
 
 ### Reference model
 
-- [ ] **`i32` range in the reference** (spec 13.3). C wraps at 32 bits; CPython ints do not. Detect a stored value that leaves `i32` range. Option: a test-mode AST rewrite that asserts range.
+- [x] **`i32` range in the reference** (spec 13.3). `CHECK_I32` checks stored values after each `tick`; the tests set it.
 
-- [ ] **`f32` rounding in the reference** (spec 13.4). Option: emulate `f32` with `numpy.float32`, for a bit-near check of the `float` build. Cost: a slower reference and NumPy at runtime.
+- [ ] **`f32` rounding in the reference** (spec 13.4). `numpy.float32` is ruled out: its `sin` and `tanh` differ from libm. Remaining option: a test-only shadow reference calling libm `f` functions through ctypes.
 
 ### Before v1.0
 

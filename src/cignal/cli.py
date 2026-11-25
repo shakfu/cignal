@@ -35,6 +35,10 @@ def main(argv: list[str] | None = None) -> int:
     fetch_headers.add_argument("hosts", nargs="*", choices=sorted(HOSTS), help="default: all")
 
     args = parser.parse_args(argv)
+    if args.command == "build":
+        for flag, shim in [("pd_include", "pd"), ("pd_name", "pd"), ("sc_include", "sc"), ("sc_name", "sc")]:
+            if getattr(args, flag) is not None and args.shim != shim:
+                parser.error(f"--{flag.replace('_', '-')} needs --shim {shim}")
     if args.command == "fetch-headers":
         try:
             for host in args.hosts or sorted(HOSTS):

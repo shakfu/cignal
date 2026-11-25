@@ -84,7 +84,7 @@ def render_shim(shim: str, kernel: CKernel, pd_name: str | None = None, sc_name:
     filename = "sc.cpp.in" if shim == "sc" else f"{shim}.c.in"
     template = resources.files("cignal.shims").joinpath(filename).read_text()
     pd_name = pd_name or pd_object_name(kernel)
-    if not pd_name.endswith("~") or not pd_name[:-1].replace("_", "a").isalnum():
+    if not pd_name.endswith("~") or not (pd_name[:-1].isidentifier() and pd_name.isascii()):
         raise BuildError(f"Pd object name {pd_name!r} must be an identifier followed by `~`")
     sc_name = sc_name or sc_ugen_name(kernel)
     if not (sc_name.isidentifier() and sc_name[0].isupper() and sc_name.isascii()):
@@ -223,9 +223,25 @@ def find_scsynth() -> Path | None:
     return next((Path(c) for c in candidates if c and Path(c).is_file()), None)
 
 
+SCLANG_RESERVED = frozenset(
+    "arg classvar const var nil true false this super inf pi thisProcess thisThread thisFunction thisFunctionDef "
+    "thisMethod".split()
+)
+
+
 def sc_class_file(kernel: CKernel, sc_name: str) -> str:
-    """The sclang class that makes the UGen usable from SuperCollider code."""
+    """The sclang class that makes the UGen usable from SuperCollider code.
+
+    Raises:
+        BuildError: a parameter name is not a valid sclang argument name.
+    """
     inputs = [f"in{k}" for k in range(kernel.n_inputs)]
+    for name, *_ in kernel.params:
+        if not ("a" <= name[0] <= "z" and name.isascii()) or name in SCLANG_RESERVED or name in inputs:
+            raise BuildError(
+                f"parameter {name!r} is not a valid sclang argument name: it must start with a lowercase "
+                f"ASCII letter and not be a keyword or an input name ({', '.join(inputs) or 'none'})"
+            )
     params = [f"{name} = {default!r}" for name, _, _, default in kernel.params]
     args = ", ".join([*inputs, *(name for name, *_ in kernel.params)])
     signature = ", ".join([*inputs, *params])

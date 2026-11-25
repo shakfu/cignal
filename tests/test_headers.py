@@ -65,6 +65,33 @@ def test_missing_file_is_a_fetch_error(tmp_path: Path) -> None:
     assert not headers_dir(PD_HEADERS).exists()
 
 
+def test_a_concurrent_fetch_that_finishes_first_is_not_an_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other fetch installs between our `rmtree` and `replace`, so the rename meets a non-empty directory."""
+    served = mirror(PD_HEADERS, tmp_path / "mirror")
+    replace = Path.replace
+
+    def racing(self: Path, target: Path) -> Path:
+        shutil.copytree(self, target)
+        return replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", racing)
+    assert fetch(served) == headers_dir(PD_HEADERS)
+    assert is_fetched(PD_HEADERS)
+
+
+def test_a_failed_install_is_a_fetch_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    served = mirror(PD_HEADERS, tmp_path / "mirror")
+
+    def failing(self: Path, target: Path) -> Path:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "replace", failing)
+    with pytest.raises(FetchError, match="Permission denied"):
+        fetch(served)
+
+
 def test_cli_fetches_every_host_by_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

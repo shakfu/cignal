@@ -315,3 +315,12 @@ def test_a_local_assigned_only_proven_values_proves_an_index(tmp_path: Path) -> 
     """)
     )
     assert "return self->b[after];" in compile_kernel(path).source
+
+
+def test_header_guard_accepts_any_file_stem(tmp_path: Path) -> None:
+    """`my-gain.v2.py` once gave `#define CIGNAL_MY-GAIN.V2_H`."""
+    path = tmp_path / "my-gain.v2.py"
+    path.write_text((FIXTURES / "biquad.py").read_text())
+    ck = compile_kernel(path)
+    assert "#define CIGNAL_MY_GAIN_V2_H" in ck.header
+    compile_object(write_kernel(ck, tmp_path / "out")[1])

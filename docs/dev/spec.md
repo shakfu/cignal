@@ -111,7 +111,7 @@ Rules:
 - `control` and `tick` do not call down. The parent calls its sub-kernels explicitly.
 - `control` runs at the start of every `K_process` call. Its effect is independent of the host's block size only if it computes from parameters and from fields `tick` does not change. The block-pattern tests (9.2) rely on this for the fixtures.
 - Methods of a kernel and its sub-kernels may call each other. The call graph must be acyclic (`CIGNAL.RECURSION`).
-- `process`, `set_param`, `reset`, `target` and `event` are reserved method names.
+- `process`, `set_param`, `set_param_immediate`, `reset`, `target` and `event` are reserved method names.
 - An event method needs both `@event` and the `on_` prefix; either alone is an error. Hosts see `<name>` without the prefix. Names Pd uses itself (`bang`, `float`, `list`, `reset`, ...) are reserved. Arguments are `f32`, `f64`, `i32` or `bool`. On a sub-kernel, an event method is a plain method its parent may call. The design is in [events.md](events.md).
 - An event may read anything, smoothed parameters included: it runs at a frame the host chose, not at a block start, so its effect does not depend on block size. Hosts get sample-accurate events by splitting `K_process` at the event's frame.
 - `K_reset` restores every field except the parameters and the sample rate, clears arrays and delays, resets sub-kernels (their `param` fields included, since those are plain fields), then re-runs `init`. `Kernel.reset()` does the same in the reference. There is no separate user hook: `init` already runs on reset.
@@ -126,7 +126,7 @@ Rules:
 - Parameters are set between blocks. Signal-rate parameters would make each one a buffer in the ABI; they are out of scope until a kernel needs them.
 - `cutoffs: Array[f32, N] = param(...)` declares N parameters with one range, default and smoothing, read through a proven index. Hosts see N scalar parameters named `cutoffs_0` to `cutoffs_{N-1}`, so the ABI and the shims are unchanged; a field with one of those names is an error. The named setter takes an element index and ignores one out of range: `K_set_cutoffs(k, element, v)`. Polyphony needs this: without it, voice 3's cutoff in an `Array[Voice, 8]` is one of 8 hand-declared parameters.
 - Setters run on the audio thread or between `K_process` calls. There are no atomics in v1. Any cross-thread handoff is the shim's job.
-- `param(..., smooth=seconds)` (M3) makes the field a one-pole glide towards the last value set. It steps once per sample, before `tick`. The setter changes only the target. The coefficient is `1 - exp(-1 / (seconds * sample_rate))`, computed in `double` at init. `kernel.smooth_step` defines the step, and the C repeats it operation for operation.
+- `param(..., smooth=seconds)` (M3) makes the field a one-pole glide towards the last value set. It steps once per sample, before `tick`. The setter changes only the target, except between `K_init` and the first `K_process`, where it sets the value too. Shims set parameters after `K_init`, so without this every new instance, and every Pd sample-rate change, glides from the default. `K_set_param_immediate` sets value and target at any time, for a preset or state load. `Kernel.set_param` and `Kernel.set_param_immediate` do the same in the reference. The coefficient is `1 - exp(-1 / (seconds * sample_rate))`, computed in `double` at init. `kernel.smooth_step` defines the step, and the C repeats it operation for operation.
 - The step snaps to the target when it makes no progress (`value + coef * d == value`), or when `|d| < 1e-20`. Without the first condition, a float smoother stalls once `coef * d` is below half a unit in the last place: the float build of the glide fixture stopped at 439.99927 for a target of 440, while the double build converged. The second condition snaps a glide towards 0 before it reaches denormals.
 - `control` may not read a smoothed parameter, directly or through methods it calls (`CIGNAL.BAD_PARAM`). The value it saw would depend on where block boundaries fall. Read it in `tick`.
 - `self.target("name")` (`self.target("name", i)` for an `Array` parameter) reads the last value set, which changes only between blocks, so `control` may read it. For an unsmoothed parameter it is the parameter itself, so adding or dropping `smooth=` does not break the call. The name must be a string literal naming a parameter of the exported kernel.
@@ -220,6 +220,16 @@ Anything else is rejected with a diagnostic that names the construct.
 | `f32(x)`, `f64(x)` | casts | |
 | `i32(x)` of a float | `cignal_to_i32` | Truncates towards zero in both languages. A C cast is undefined for NaN and out-of-range values (C99 6.3.1.4), so C saturates and maps NaN to 0, as event arguments do. CPython raises on NaN and inf, and leaves `i32` range otherwise: both are outside the contract (5.3). |
 
+- Where C returns inf or NaN, CPython raises or leaves the reals, so the reference gives no value to compare. These cases are outside the contract:
+
+  | Expression | CPython | C |
+  |-|-|-|
+  | `x / 0.0`, `x // 0.0`, `x % 0.0`, `0.0 ** -1.0` | `ZeroDivisionError` | inf or NaN |
+  | `math.log(0.0)`, `math.sqrt(-1.0)`, `math.fmod(x, 0.0)`, `math.pow(-1.0, 0.5)`, `math.sin(inf)` (and `cos`, `tan`), `math.floor(nan)` | `ValueError` | -inf or NaN |
+  | `math.exp(1000.0)`, `math.floor(inf)` | `OverflowError` | inf |
+  | `(-1.0) ** 0.5` | a complex number; `Kernel.process` raises when it reaches an output | NaN |
+
+  Float overflow in `+ - *` gives inf in both, and `inf - inf` NaN in both. `math.floor` and `math.ceil` return `int` in CPython and a float in C; the values agree for finite input.
 - Numeric literals take the type their context needs: `0.5` in an `f32` expression is emitted as `0.5f`.
 - Mixing `i32` and float variables without a cast is an error (`CIGNAL.MIXED_NUMERIC`), as in Vult.
 - Mixing `f32` and `f64` variables without a cast is an error. Literals are exempt.
@@ -228,7 +238,7 @@ Anything else is rejected with a diagnostic that names the construct.
 
 `i32` `+`, `-`, `*`, unary `-`, `**` and `<<` wrap two's-complement in C, through `uint32_t` arithmetic. Signed overflow is undefined behaviour in C; unsigned overflow is not. The conversion back to `int32_t` is implementation-defined, and GCC and clang wrap. Before the M2.5 work the generated code used plain signed operators, so this section described behaviour the code did not have.
 
-CPython ints do not wrap. A kernel whose intermediate values leave `i32` still matches CPython when it masks the result back into range, as the 31-bit LCG in `tests/fixtures/ops.py` does: its multiply overflows on every step and matches bit for bit. A kernel whose stored values leave range is outside the contract. Detecting that in the reference is an open item (section 13).
+CPython ints do not wrap. A kernel whose intermediate values leave `i32` still matches CPython when it masks the result back into range, as the 31-bit LCG in `tests/fixtures/ops.py` does: its multiply overflows on every step and matches bit for bit. A kernel whose stored values leave range is outside the contract. With `cignal.kernel.CHECK_I32` set, as the tests set it, `Kernel.process` raises `OverflowError` after any `tick` that leaves an `i32` field or `Array[i32]` element out of range, in the kernel or its sub-kernels. `Delay[i32, N]` lines are not checked: scanning them costs N per sample.
 
 ### 5.4 Index safety
 
@@ -268,6 +278,7 @@ void Lowpass_process(Lowpass *k, const float *const *in, float *const *out, int 
 void Lowpass_set_cutoff(Lowpass *k, float v);
 void Lowpass_set_q(Lowpass *k, float v);
 void Lowpass_set_param(Lowpass *k, int index, float v);
+void Lowpass_set_param_immediate(Lowpass *k, int index, float v); /* no glide */
 
 /* Events: one function per `on_<name>`, and a dispatcher taking host values by index. */
 void Lowpass_event(Lowpass *k, int index, const float *args);
@@ -327,7 +338,7 @@ Shims, in order:
 
 1. **`driver`** (v1, required): a standalone `main` that reads interleaved native-endian samples from stdin and writes them to stdout. The sample rate and a block-size pattern come from the command line. Tests and benchmarks use it.
 2. **Pd** (v1, M0; parameters in M1). Inlets are the signal inputs, then one float inlet per parameter. A kernel without signal inputs takes its first parameter on the left inlet, as `osc~` does. Creation arguments set the parameters in order. The shim re-applies every parameter at the start of each block, which also restores them after a sample-rate change re-runs `K_init`. The object name defaults to the lowercased kernel name plus `~`, and `--pd-name` overrides it. A name that matches a Pd built-in (`biquad~`, `lop~`) loads the built-in instead, without an error. A message `<param> value` on the left inlet sets a parameter as its inlet does (`freqs_3 440`), so a kernel with many parameters needs no patch cords to each. A parameter named like a Pd selector (`float`, `reset`, ...) keeps only its inlet, and an event with a parameter's name is an error. Each event is a message on the left inlet, `note 60 0.8`; missing arguments are 0. The shim applies pending parameter inlets before an event, so the event sees every parameter sent before it. Pd parses `nan` in a message as a symbol, which arrives as 0.
-3. **SuperCollider** (M4). `cignal build --shim sc` writes and compiles a UGen plugin (`.so` on Linux, `.scx` on macOS) and its sclang class file.
+3. **SuperCollider** (M4). `cignal build --shim sc` writes and compiles a UGen plugin (`.so` on Linux, `.scx` on macOS) and its sclang class file. Parameter names become sclang argument names, so the build rejects a name that starts with a capital, is an sclang keyword (`var`, `nil`, `thisProcess`, ...) or matches an input (`in0`).
    - The UGen name defaults to `Cignal` plus the kernel name, to stay clear of core UGens; `--sc-name` overrides it.
    - Inputs are the signal inputs, then one input per parameter, read once per block. A `reset` unit command (`/u_cmd node ugen "reset"`) calls `K_reset`.
    - Each event is a unit command: `/u_cmd node ugen "note" 60 0.8`. An event sees the parameters as of the last block, since inputs are read in the calculation function.
@@ -502,8 +513,8 @@ Sizing at init from the sample rate needs a size query before allocation, plus h
 
 1. **First real host.** Decided: Pd, built in M0. It has a plain C API and runs headless.
 2. **Parameter smoothing.** Decided in M3: per sample, readable only outside `control` (section 3.4).
-3. **`i32` overflow in the reference.** The C side now wraps (section 5.3). Detecting a stored value that leaves range in the reference is still open. Option: a test-mode AST rewrite that asserts range. Cost: the reference is no longer exactly the user's source.
-4. **`f32` rounding in the reference.** Option: emulate `f32` through `numpy.float32` for bit-near comparison of the `float` build. Cost: a slower reference and NumPy at runtime.
+3. **`i32` overflow in the reference.** Decided: `CHECK_I32` checks stored values after each `tick` (section 5.3). It needs no rewrite of the user's source, and the suite went from 48 s to 52 s. An AST rewrite asserting range on every operation was the alternative. A wrap inside an expression that the kernel masks back into range is not an error, and matches C (`ops.py`).
+4. **`f32` rounding in the reference.** Open. `numpy.float32` cannot give a bit-exact reference: NumPy computes `sin` and `tanh` itself, and differed from Apple's `sinf` on 15% and `tanhf` on 38% of 20000 inputs (macOS arm64, 2026-11-25; `exp` and `log` matched). It would also make NumPy a runtime dependency and run arithmetic at least 2x slower. A bit-exact `float` reference would have to call the libm `f` functions through ctypes, in a test-only shadow of the reference. The SNR test (9.1) stands meanwhile.
 5. **Fixed-point output** (Vult's `-real fixed`, q16.16) for Teensy and Eurorack hardware. Only if hardware targets are near-term.
 6. **Multi-channel instances for SIMD.** Measured: not needed, since `Array[K, N]` gives the parallelism ([simd.md](simd.md)). Open: whether field layout becomes ABI at v1.0. Making it not ABI would allow a struct-of-arrays `Array[K, N]` without a host change.
 

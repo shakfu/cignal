@@ -3,10 +3,14 @@
 Each case applies its parameter changes mid-stream, so these also test `set_param` and `control`.
 """
 
+import re
+
 import numpy as np
 import pytest
 from conftest import Driver
 from support import CASES, SAMPLE_RATE, Case, Change, reference, run_driver, signals, snr_db
+
+from cignal import Array, Kernel, f32, i32
 
 SIGNALS = signals()
 BLOCK_PATTERNS = ["1", "7", "64", "128", "3,61,64,1", "4800"]
@@ -105,6 +109,26 @@ def test_float_smoothing_reaches_its_target_without_denormals(driver: Driver) ->
     assert not denormal.any()
 
 
+def test_a_parameter_set_before_the_first_block_starts_there(driver: Driver) -> None:
+    """Shims set parameters after `K_init`; gliding from the default would sweep every new instance."""
+    case = next(c for c in CASES if c.kernel == "Glide")  # sets 440 at frame 0, then 0 at frame 2000
+    for build, dtype in [("double", np.float64), ("float", np.float32)]:
+        level = run_driver(driver(case, build), case, SIGNALS["impulse"], dtype)[0]
+        assert level[0] == 440.0, build
+        assert 0.0 < level[2000] < 440.0, build  # later changes still glide
+
+
+def test_set_param_immediate_skips_the_glide(driver: Driver) -> None:
+    case = next(c for c in CASES if c.kernel == "Glide")
+    changes: tuple[Change, ...] = ((0, "level", 440.0), (1000, "now:level", -200.0), (2000, "level", 0.0))
+    x = SIGNALS["impulse"]
+    expected = reference(case, x, changes)
+    assert expected[0][1000] == -200.0 and expected[1][1000] == -200.0  # value and target
+    assert 0.0 > expected[0][2000] > -200.0
+    assert np.array_equal(run_driver(driver(case, "double"), case, x, np.float64, changes=changes), expected)
+    assert run_driver(driver(case, "float"), case, x, np.float32, changes=changes)[0][1000] == -200.0
+
+
 @pytest.mark.parametrize("kernel", ["Lowpass", "Drive"])  # Drive's parameter is smoothed
 def test_nan_parameter_takes_lo(driver: Driver, kernel: str) -> None:
     """NaN fails both clamp comparisons; stored, it would stay in recursive state until `reset`."""
@@ -116,3 +140,39 @@ def test_nan_parameter_takes_lo(driver: Driver, kernel: str) -> None:
     assert np.all(np.isfinite(expected))
     actual = run_driver(driver(case, "double"), case, x, np.float64, changes=changes)
     assert np.array_equal(actual, expected)
+
+
+def test_reference_names_a_complex_power() -> None:
+    """CPython's `(-1.0) ** 0.5` is complex where C gives NaN; `float()` alone would not say why it failed."""
+
+    class Root(Kernel):
+        def tick(self, x: f32) -> f32:
+            return x**0.5
+
+    with pytest.raises(ValueError, match="fractional power is complex"):
+        Root(SAMPLE_RATE).process([[-1.0]], 1)
+
+
+class Counter(Kernel):
+    n: i32 = 2**31 - 2
+    steps: Array[i32, 2]
+
+    def tick(self, x: f32) -> f32:
+        self.n += 1
+        return x
+
+
+class Outer(Kernel):
+    inner: Array[Counter, 2]
+
+    def tick(self, x: f32) -> f32:
+        return self.inner[1].tick(x)
+
+
+@pytest.mark.parametrize(("kernel", "path"), [(Counter, "Counter.n"), (Outer, "Outer.inner[1].n")])
+def test_reference_rejects_a_stored_i32_that_c_would_wrap(kernel: type[Kernel], path: str) -> None:
+    """Spec 5.3: the first tick stores 2**31 - 1, which fits; the second stores 2**31."""
+    k = kernel(SAMPLE_RATE)
+    k.process([[0.0]], 1)
+    with pytest.raises(OverflowError, match=rf"{re.escape(path)} = 2147483648 after `tick`"):
+        k.process([[0.0]], 1)

@@ -8,6 +8,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 - `cignal build --manifest` writes `<stem>.cignal.json`: file names, C symbol prefix, I/O counts, parameters and events (spec 6). gen-dsp reads it to wrap a kernel as a CLAP plugin without importing cignal. Reading `K_info` at run time was the alternative, but a generator needs parameter names before anything is compiled.
 
+- `K_set_param_immediate(k, index, v)` and `Kernel.set_param_immediate` set a smoothed parameter without a glide, for a preset or state load.
+
+- A `CIGNAL.BAD_PARAM` warning for `param()` on a sub-kernel, whose range and smoothing never apply.
+
+- Spec 5.2 lists the float operations where CPython raises or goes complex and C returns inf or NaN. They are outside the contract. A complex `tick` output now raises a `ValueError` that names the cause.
+
+- `cignal.kernel.CHECK_I32`: `Kernel.process` raises when a `tick` leaves an `i32` field out of range, where C wraps. The tests set it; no fixture trips it. An AST rewrite checking every operation was the alternative; it would run code other than the user's (spec 5.3, 13.3).
+
+### Changed
+
+- `--pd-name`, `--pd-include`, `--sc-name` and `--sc-include` are errors without the matching `--shim`. They were ignored.
+
+- A smoothed parameter set between `K_init` and the first `K_process` starts at that value. Shims set parameters after `K_init`, so each new Pd object or SC synth glided from the default to its creation value, and Pd repeated the glide after a sample-rate change. A flag in the struct does this, so no host needed a change; requiring hosts to call `K_set_param_immediate` was the alternative, and a host that forgot would still glide.
+
 ### Fixed
 
 - Evaluation order. C leaves the order of operands and call arguments unspecified, and every `i32` `+ - *` is a helper call, so `self.n + self.bump()` could read `self.n` after the call. A statement that calls a method and touches `self` elsewhere now hoists each state read and call into a temporary, in Python's order. An order-sensitive operand of `and`, `or` or `if`-`else` is an error. A `range` start with a non-constant stop was evaluated after the stop; it now goes first. Rejecting statements with two calls was the alternative; it rejects `self.a.tick() + self.b.tick()` (spec 5.6).
@@ -15,6 +29,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 - `i32(x)` of a float was a raw C cast, undefined for NaN and out-of-range values. It now saturates and maps NaN to 0, as event arguments do. CPython raises there, so neither result is part of the contract (spec 5.2).
 
 - A NaN parameter value passed the setter's clamp and stayed in filter state until `reset`. Setters now map it to `lo`, in C and in `Kernel.set_param`, as table lookups and `read_frac` already did.
+
+- A file stem with `-` or `.` (`my-gain.py`) gave a header guard that does not compile. Those characters now map to `_`.
+
+- An int constant beyond double range (`10**400`) crashed the compiler. It now reports `CONSTANT_RANGE`.
+
+- `--pd-name 2pole~` was accepted and failed in the C compiler. Pd names must now be ASCII identifiers plus `~`.
+
+- `--shim sc` wrote an sclang class file that sclang rejects when a parameter was named `Gain`, `var` or `in0`. The build now reports these names (spec 8).
+
+- `make clean` deleted the extension modules in `.venv`.
+
+- Two concurrent `cignal fetch-headers` runs could fail with a traceback: the second rename met the first's directory. It now succeeds when the cache holds the verified files, and any other install failure is a fetch error.
+
+- `make docs` is gone: `docs/` has no Sphinx project. `pyproject.toml` no longer lists Python 3.15 or PyPy, which CI does not test, and its keywords were placeholders.
+
+- `make test-linux` did not copy `thirdparty/`, so 7 `test_headers` tests failed in the container.
 
 ## [0.1.0]
 

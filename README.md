@@ -14,7 +14,9 @@ Status: 0.x, on [PyPI](https://pypi.org/project/cignal/). The language and the A
 
 ## Requirements
 
-- Python 3.12 or later, and [uv](https://docs.astral.sh/uv/).
+- macOS or Linux. Windows is not supported.
+
+- Python 3.12 or later (CPython), and [uv](https://docs.astral.sh/uv/).
 
 - A C99 compiler (`cc`, or `$CC`). The SuperCollider shim also needs a C++17 compiler (`c++`, or `$CXX`).
 
@@ -124,7 +126,7 @@ A file with several kernels needs `--kernel NAME`, unless only one of them is no
 
 - **Pd.** Inlets are the signal inputs, then one float inlet per parameter. Creation arguments set the parameters in order, and a `reset` message clears state. `cutoff 800` on the left inlet sets a parameter, and events are messages there too: `note 60 0.8`. Pick a name that is not a Pd built-in with `--pd-name`: `biquad~` would load Pd's own object, without an error.
 
-- **SuperCollider.** Copy the plugin and the `.sc` class file into an extensions folder. UGen inputs are the signal inputs, then one input per parameter: `CignalLowpass.ar(sig, 800, 2)`. Parameters are read once per block. `/u_cmd node ugen "reset"` clears state, and `/u_cmd node ugen "note" 60 0.8` sends an event.
+- **SuperCollider.** Copy the plugin and the `.sc` class file into an extensions folder. UGen inputs are the signal inputs, then one input per parameter: `CignalLowpass.ar(sig, 800, 2)`. Parameters are read once per block. `/u_cmd node ugen "reset"` clears state, and `/u_cmd node ugen "note" 60 0.8` sends an event. The kernel struct, delay lines included, lives in scsynth's real-time pool, which is 8 MB unless `scsynth -m` raises it. A synth whose kernel does not fit fails to start.
 
 Both shims flush denormals to zero while the kernel runs, and restore the host's mode afterwards.
 

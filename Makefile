@@ -1,6 +1,6 @@
 .PHONY: all sync build rebuild test lint lint-check format format-check \
         typecheck qa clean distclean wheel sdist dist check publish-test \
-        publish bench linux-image test-linux upgrade coverage coverage-html docs release help
+        publish bench linux-image test-linux upgrade coverage coverage-html release help
 
 # Default target
 all: build
@@ -84,7 +84,7 @@ linux-image:
 
 test-linux:
 	@container run --rm --arch $(ARCH) -v "$(CURDIR)":/src:ro $(LINUX_IMAGE) sh -c '\
-		cp -r /src/src /src/tests /src/pyproject.toml /src/uv.lock /src/README.md /src/LICENSE /work/ && \
+		cp -r /src/src /src/tests /src/thirdparty /src/pyproject.toml /src/uv.lock /src/README.md /src/LICENSE /work/ && \
 		uv sync -q && uv run pytest -p no:cacheprovider'
 
 # Run tests with coverage
@@ -95,11 +95,6 @@ coverage:
 coverage-html:
 	@uv run pytest tests/ -v --cov=src/cignal --cov-report=html
 	@echo "Coverage report: htmlcov/index.html"
-
-# Build documentation (sphinx is fetched on demand; add it to the dev group
-# to pin a version)
-docs:
-	@uv run --with sphinx sphinx-build -b html docs/ docs/_build/html
 
 # Create a release (bump version, tag, push)
 release:
@@ -118,9 +113,9 @@ clean:
 	@rm -rf *.egg-info/
 	@rm -rf src/*.egg-info/
 	@rm -rf .pytest_cache/
-	@find . -name "*.so" -delete
-	@find . -name "*.pyd" -delete
-	@find . -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+	@find . -not -path './.venv/*' -name "*.so" -delete
+	@find . -not -path './.venv/*' -name "*.pyd" -delete
+	@find . -not -path './.venv/*' -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
 
 # Clean everything, including the resolved environment
 distclean: clean
@@ -152,7 +147,6 @@ help:
 	@echo "  test-linux   - Test linux platform with container"	
 	@echo "  coverage     - Run tests with coverage"
 	@echo "  coverage-html - Generate HTML coverage report"
-	@echo "  docs         - Build documentation with Sphinx"
 	@echo "  release      - Bump version, tag, and prepare release"
 	@echo "  clean        - Remove build artifacts"
 	@echo "  distclean    - Remove all generated files"

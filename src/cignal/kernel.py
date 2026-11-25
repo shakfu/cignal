@@ -7,7 +7,7 @@ they are plain aliases, so kernels run unchanged as the reference model.
 
 import inspect
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeAlias, cast
 
@@ -18,6 +18,11 @@ i32: TypeAlias = int
 
 # A smoothed value closer than this to its target snaps to it, before it can become denormal.
 SMOOTH_SNAP = 1e-20
+
+# When true, `Kernel.process` raises after any `tick` that leaves an `i32` field outside `i32` range, where C
+# would have wrapped (spec 5.3). The tests set it.
+CHECK_I32 = False
+I32_MIN, I32_MAX = -(2**31), 2**31 - 1
 
 
 @dataclass(frozen=True)
@@ -181,6 +186,28 @@ class Delay:
         self.pos = 0
 
 
+_I32_PLANS: dict[type, tuple[tuple[str, str], ...]] = {}
+
+
+def _i32_plan(cls: type) -> tuple[tuple[str, str], ...]:
+    """The fields of `cls` that hold `i32` values, directly or in sub-kernels, and how to read them."""
+    if cls in _I32_PLANS:
+        return _I32_PLANS[cls]
+    plan = []
+    for name, hint in inspect.get_annotations(cls, eval_str=True).items():
+        if hint is int:
+            plan.append((name, "scalar"))
+        elif isinstance(hint, type) and issubclass(hint, Kernel) and _i32_plan(hint):
+            plan.append((name, "kernel"))
+        elif isinstance(hint, Spec) and hint.kind is Array and hint.element is int:
+            plan.append((name, "array"))
+        elif isinstance(hint, Spec) and hint.kind is Array and isinstance(hint.element, type) and \
+                issubclass(hint.element, Kernel) and _i32_plan(hint.element):  # fmt: skip
+            plan.append((name, "kernels"))
+    _I32_PLANS[cls] = tuple(plan)
+    return _I32_PLANS[cls]
+
+
 class Kernel:
     """Base class for DSP kernels. Fields are state; `tick` runs once per sample."""
 
@@ -213,6 +240,7 @@ class Kernel:
                 setattr(self, name, Array(hint, self.sample_rate, fill) if hint.kind is Array else hint.kind(hint))
             elif isinstance(hint, type) and issubclass(hint, Kernel) and name not in vars(cls):
                 setattr(self, name, hint(sample_rate))
+        self._fresh = True  # until the first `process`, `set_param` also moves a smoothed value
         self.init()
 
     def init(self) -> None:
@@ -243,7 +271,17 @@ class Kernel:
         self.init()
 
     def set_param(self, name: str, value: float) -> None:
-        """Set a parameter by host name (`x`, or `x_k` for an `Array` element), clamped like the C setter, NaN to lo."""
+        """Set a parameter by host name (`x`, or `x_k` for an `Array` element), clamped like the C setter, NaN to lo.
+
+        A smoothed parameter glides to the value, except before the first `process`, where it starts there.
+        """
+        self._set_param(name, value, self._fresh)
+
+    def set_param_immediate(self, name: str, value: float) -> None:
+        """Set a parameter as `set_param` does, and move a smoothed one to the value without a glide."""
+        self._set_param(name, value, True)
+
+    def _set_param(self, name: str, value: float, now: bool) -> None:
         if name not in self._slots:
             raise KeyError(f"{type(self).__name__} has no parameter {name!r}")
         slot = self._slots[name]
@@ -251,7 +289,7 @@ class Kernel:
         clamped = p.lo if not value >= p.lo else p.hi if value > p.hi else value
         if slot in self._smoothing:
             self._smoothing[slot][0] = clamped
-        else:
+        if now or slot not in self._smoothing:
             self._put(slot, clamped)
 
     def target(self, name: str, index: int | None = None) -> float:
@@ -276,6 +314,20 @@ class Kernel:
         converted = [event_i32(v) if t is int else v != 0 if t is bool else float(v) for t, v in pairs]
         getattr(self, f"on_{name}")(*converted)
 
+    def _i32_values(self, prefix: str = "") -> Iterator[tuple[str, int]]:
+        """Every `i32` field and `Array[i32]` element, here and in sub-kernels, with its path. Not `Delay` lines."""
+        for name, kind in _i32_plan(type(self)):
+            value = getattr(self, name)
+            if kind == "scalar":
+                yield prefix + name, value
+            elif kind == "array":
+                yield from ((f"{prefix}{name}[{k}]", v) for k, v in enumerate(value))
+            elif kind == "kernel":
+                yield from value._i32_values(f"{prefix}{name}.")
+            else:
+                for k, sub in enumerate(value):
+                    yield from sub._i32_values(f"{prefix}{name}[{k}].")
+
     def _get(self, slot: tuple[str, int | None]) -> float:
         name, k = slot
         return float(getattr(self, name) if k is None else getattr(self, name)[k])
@@ -289,6 +341,7 @@ class Kernel:
 
     def process(self, inputs: Sequence[Sequence[float]], n: int) -> list[list[float]]:
         """Run `control`, then `tick` over `n` samples of `inputs` (one sequence per channel)."""
+        self._fresh = False
         self.control()
         tick = getattr(self, "tick")  # noqa: B009 - subclasses define tick; the base class does not
         outputs: list[list[float]] = []
@@ -296,9 +349,19 @@ class Kernel:
             for slot, (target, coef) in self._smoothing.items():
                 self._put(slot, smooth_step(self._get(slot), target, coef))
             result = tick(*(channel[i] for channel in inputs))
+            if CHECK_I32:
+                for path, value in self._i32_values():
+                    if not I32_MIN <= value <= I32_MAX:
+                        raise OverflowError(f"{type(self).__name__}.{path} = {value} after `tick`: outside i32, "
+                                            "where C wraps (spec 5.3)")  # fmt: skip
             values = result if isinstance(result, tuple) else (result,)
             if not outputs:
                 outputs = [[] for _ in values]
             for channel, value in zip(outputs, values, strict=True):
+                if isinstance(value, complex):  # float(value) would raise without naming the cause
+                    raise ValueError(
+                        f"`tick` returned {value!r}: in CPython a negative float to a fractional "
+                        "power is complex, where C gives NaN (spec 5.2)"
+                    )
                 channel.append(float(value))
         return outputs

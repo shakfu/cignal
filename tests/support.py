@@ -220,6 +220,9 @@ def _module(fixture: str) -> ModuleType:
     return module
 
 
+NOW = "now:"  # a change named `now:<param>` calls `set_param_immediate`
+
+
 def reference(case: Case, x: np.ndarray, changes: tuple[Change, ...] | None = None) -> np.ndarray:
     """Run the kernel under CPython, splitting `process` calls at the parameter changes."""
     changes = case.changes if changes is None else changes
@@ -237,6 +240,8 @@ def reference(case: Case, x: np.ndarray, changes: tuple[Change, ...] | None = No
             kernel.event(name, *value)
         elif name == "reset":
             kernel.reset()
+        elif name.startswith(NOW):
+            kernel.set_param_immediate(name.removeprefix(NOW), value)
         elif name:
             kernel.set_param(name, value)
     return np.array(out)
@@ -253,6 +258,8 @@ def run_driver(
             args += ["--event", f"{frame}:{case.event_index(name)}:{','.join(map(repr, value))}"]
         elif name == "reset":
             args += ["--reset", str(frame)]
+        elif name.startswith(NOW):
+            args += ["--set-now", f"{frame}:{case.param_index(name.removeprefix(NOW))}:{value!r}"]
         else:
             args += ["--set", f"{frame}:{case.param_index(name)}:{value!r}"]
     proc = subprocess.run(args, input=data.T.astype(dtype).tobytes(), capture_output=True, check=True)

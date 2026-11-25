@@ -5,10 +5,12 @@ from pathlib import Path
 import pytest
 from support import FIXTURES, Case
 
+import cignal.kernel
 from cignal.build import REFERENCE_FLAGS, build_driver, find_pd_include, find_sc_include
 from cignal.compiler import Target
 
 Driver = Callable[[Case, str], Path]
+cignal.kernel.CHECK_I32 = True  # the reference fails where a stored i32 would wrap in C
 THIRDPARTY = Path(__file__).parents[1] / "thirdparty"
 
 # Fall back to the repository's copy of the host headers. Test modules call the finders at import, after this.

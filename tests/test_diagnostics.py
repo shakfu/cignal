@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from support import FIXTURES
 
+from cignal.build import BuildError, render_shim, sc_class_file
 from cignal.cli import main
 from cignal.compiler import compile_kernel
 from cignal.diagnostics import CompileError, RuleId
@@ -52,6 +53,7 @@ CASES = [
     (RuleId.MIXED_NUMERIC, kernel("n: i32 = 0", tick="return x + self.n"), 7),
     (RuleId.TYPE_MISMATCH, kernel(tick="if x:\n    return x\nreturn x"), 6),
     (RuleId.CONSTANT_RANGE, kernel(tick="return x * 1e39"), 6),
+    (RuleId.CONSTANT_RANGE, kernel(tick="return x * 10**400"), 6),  # beyond double range
     (RuleId.BAD_PARAM, kernel("g: f32 = param(1.0, lo=2.0, hi=3.0)"), 5),
     (RuleId.RECURSION, kernel("def f(self, a: f32) -> f32:\n    return self.f(a)", tick="return self.f(x)"), 5),
     # Regression cases for restrictions that share a rule id with the cases above.
@@ -120,6 +122,7 @@ CASES = [
         7,
     ),
     (RuleId.BAD_SIGNATURE, kernel("def target(self) -> f32:\n    return 0.0"), 5),
+    (RuleId.BAD_SIGNATURE, kernel("def set_param_immediate(self) -> f32:\n    return 0.0"), 5),
     (RuleId.UNSUPPORTED_SYNTAX, kernel(ARRAY_PARAM, tick="self.g[0] = x\nreturn x"), 7),
     (
         RuleId.BAD_PARAM,
@@ -193,6 +196,13 @@ CASES = [
 # Warnings do not stop the build; they are returned with the generated code.
 WARNING_CASES = [
     (RuleId.UNBOUNDED_LOOP, kernel(tick="while x > 1.0:\n    x = x - 1.0\nreturn x"), 6),
+    (
+        RuleId.BAD_PARAM,
+        HEADER + "class S(Kernel):\n    g: f32 = param(1.0, lo=0.0, hi=2.0)\n    def tick(self, x: f32) -> f32:\n"
+        "        return x * self.g\nclass K(Kernel):\n    s: S\n    def tick(self, x: f32) -> f32:\n"
+        "        return self.s.tick(x)\n",
+        5,
+    ),
 ]
 
 
@@ -216,7 +226,7 @@ def test_rule(tmp_path: Path, rule: str, source: str, line: int | None) -> None:
     path.write_text(source)
     with pytest.raises(CompileError) as info:
         compile_kernel(path)
-    first = info.value.diagnostics[0]
+    first = next(d for d in info.value.diagnostics if d.is_error)  # warnings may come first
     assert first.rule_id == rule, info.value
     if line is not None:
         assert first.span is not None and first.span.line == line, info.value
@@ -249,6 +259,13 @@ def test_build_cli_writes_header_and_source(tmp_path: Path) -> None:
     assert (tmp_path / "biquad.h").is_file() and (tmp_path / "biquad.c").is_file()
 
 
+@pytest.mark.parametrize("flag", ["--pd-name=x~", "--pd-include=.", "--sc-name=X", "--sc-include=."])
+def test_build_cli_rejects_a_host_flag_without_its_shim(tmp_path: Path, flag: str) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["build", str(FIXTURES / "biquad.py"), "-o", str(tmp_path), "--shim", "driver", flag])
+    assert exc.value.code == 2
+
+
 def test_build_cli_writes_manifest(tmp_path: Path) -> None:
     """The manifest names the files written beside it and the C symbols the header declares."""
     assert main(["build", str(FIXTURES / "synth.py"), "-o", str(tmp_path), "--prefix", "fx_", "--manifest"]) == 0
@@ -262,3 +279,20 @@ def test_build_cli_writes_manifest(tmp_path: Path) -> None:
     assert [(e["name"], tuple(e["args"])) for e in data["events"]] == ck.events
     header = (tmp_path / data["header"]).read_text()
     assert f"void {data['c_name']}_process(" in header and f"{data['c_name']}_info;" in header
+
+
+@pytest.mark.parametrize("name", ["2pole~", "lowpass", "l\u00e9~", "a-b~"])
+def test_pd_name_must_be_an_ascii_identifier_and_tilde(name: str) -> None:
+    ck = compile_kernel(FIXTURES / "biquad.py")
+    with pytest.raises(BuildError, match="Pd object name"):
+        render_shim("pd", ck, pd_name=name)
+
+
+@pytest.mark.parametrize("name", ["in0", "Gain", "var", "thisProcess"])
+def test_sc_class_file_rejects_invalid_parameter_names(tmp_path: Path, name: str) -> None:
+    path = tmp_path / "k.py"
+    path.write_text(kernel(f"{name}: f32 = param(1.0, lo=0.0, hi=2.0)", tick=f"return x * self.{name}"))
+    ck = compile_kernel(path)
+    with pytest.raises(BuildError, match=repr(name)):
+        sc_class_file(ck, "CignalK")
+    assert "cutoff = " in sc_class_file(compile_kernel(FIXTURES / "lowpass.py"), "CignalLowpass")

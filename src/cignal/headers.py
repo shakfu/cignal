@@ -129,9 +129,13 @@ def fetch(headers: Headers) -> Path:
                 raise FetchError(f"{url}: SHA-256 {actual}, expected {expected}")
             (staged / local).parent.mkdir(parents=True, exist_ok=True)
             (staged / local).write_bytes(data)
-        if dest.exists():
-            shutil.rmtree(dest)
-        staged.replace(dest)
+        try:
+            if dest.exists():
+                shutil.rmtree(dest)
+            staged.replace(dest)
+        except OSError as exc:
+            if not is_fetched(headers):  # else a concurrent fetch installed the same files first
+                raise FetchError(f"{dest}: {exc}") from exc
     return dest
 
 
