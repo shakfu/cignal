@@ -103,3 +103,16 @@ def test_float_smoothing_reaches_its_target_without_denormals(driver: Driver) ->
     assert y[-1] == 0.0
     denormal = (y != 0) & (np.abs(y) < np.finfo(np.float32).tiny)
     assert not denormal.any()
+
+
+@pytest.mark.parametrize("kernel", ["Lowpass", "Drive"])  # Drive's parameter is smoothed
+def test_nan_parameter_takes_lo(driver: Driver, kernel: str) -> None:
+    """NaN fails both clamp comparisons; stored, it would stay in recursive state until `reset`."""
+    case = next(c for c in CASES if c.kernel == kernel)
+    x = SIGNALS["noise"]
+    changes: tuple[Change, ...] = tuple((1000 + 500 * k, name, float("nan")) for k, (name, *_) in
+                                        enumerate(case.info.params))  # fmt: skip
+    expected = reference(case, x, changes)
+    assert np.all(np.isfinite(expected))
+    actual = run_driver(driver(case, "double"), case, x, np.float64, changes=changes)
+    assert np.array_equal(actual, expected)

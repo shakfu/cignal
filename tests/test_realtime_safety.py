@@ -3,10 +3,11 @@
 import subprocess
 from pathlib import Path
 
+import numpy as np
 import pytest
 from support import CASES, FIXTURES, Case
 
-from cignal.build import compile_object, write_kernel
+from cignal.build import BuildError, build_driver, compile_object, write_kernel
 from cignal.compiler import compile_kernel
 
 # Calls compilers substitute for source code. Apple clang fuses sinf/cosf pairs into libm's sincos,
@@ -26,3 +27,30 @@ def test_kernel_object_references_only_libm(tmp_path: Path, case: Case) -> None:
     undefined = {line.split()[-1].removeprefix("_") for line in nm.stdout.splitlines() if line.strip()}
     allowed = ck.math_symbols | COMPILER_LIBM | COMPILER_MEMORY
     assert undefined <= allowed, undefined - allowed
+
+
+CAST_KERNEL = """
+from cignal import Kernel, f32, i32
+
+class Cast(Kernel):
+    def tick(self, x: f32) -> f32:
+        return f32(i32(x))
+"""
+
+
+def test_float_to_i32_cast_is_defined_for_every_input(tmp_path: Path) -> None:
+    """A C cast is undefined for NaN and out-of-range values (C99 6.3.1.4); `i32()` saturates, NaN to 0.
+
+    On arm64 the raw cast happens to saturate too, so the sanitizer, not the output, catches a regression.
+    """
+    (tmp_path / "cast.py").write_text(CAST_KERNEL)
+    sanitize = ("-fsanitize=float-cast-overflow", "-fno-sanitize-recover=all")
+    try:
+        exe = build_driver(tmp_path / "cast.py", tmp_path, extra_flags=sanitize)
+    except BuildError as exc:
+        pytest.skip(f"no float-cast-overflow sanitizer: {exc}")
+    x = np.array([np.nan, np.inf, -np.inf, 3e9, -3e9, 2.7, -2.7], dtype=np.float32)
+    proc = subprocess.run([str(exe), "48000", "64"], input=x.tobytes(), capture_output=True, check=True)
+    assert proc.stderr == b""
+    expected = [0.0, 2.0**31, -(2.0**31), 2.0**31, -(2.0**31), 2.0, -2.0]
+    assert np.frombuffer(proc.stdout, dtype=np.float32).tolist() == expected

@@ -122,7 +122,7 @@ Rules:
 `param(default, lo=, hi=)` marks a field as a host-controlled parameter. It is honoured only on the exported kernel. On a sub-kernel it is a plain field with a default.
 
 - Parameters are `f32` or `f64`, and read-only in kernel code. Hosts set every parameter as a `sample`; an `f64` parameter widens the value, then clamps and smooths it in `double` in both builds. A pitch needs this: a phase integrates every rounding of its frequency, and an `f32` smoothed pitch measured 98 dB on the float build of the synth fixture, against 115 dB for `f64`.
-- Setters clamp to `[lo, hi]`. `Kernel.set_param` clamps the same way in the reference.
+- Setters clamp to `[lo, hi]`, with NaN mapped to `lo`. Stored, a NaN would stay in recursive state until `reset`, and a SuperCollider input can carry one. `Kernel.set_param` clamps the same way in the reference.
 - Parameters are set between blocks. Signal-rate parameters would make each one a buffer in the ABI; they are out of scope until a kernel needs them.
 - `cutoffs: Array[f32, N] = param(...)` declares N parameters with one range, default and smoothing, read through a proven index. Hosts see N scalar parameters named `cutoffs_0` to `cutoffs_{N-1}`, so the ABI and the shims are unchanged; a field with one of those names is an error. The named setter takes an element index and ignores one out of range: `K_set_cutoffs(k, element, v)`. Polyphony needs this: without it, voice 3's cutoff in an `Array[Voice, 8]` is one of 8 hand-declared parameters.
 - Setters run on the audio thread or between `K_process` calls. There are no atomics in v1. Any cross-thread handoff is the shim's job.
@@ -217,7 +217,8 @@ Anything else is rejected with a diagnostic that names the construct.
 | `and or not`, comparisons | same | `a < b < c` becomes `a < b && b < c`, with Python's short-circuit order. Middle operands are evaluated twice, so they may not contain calls. |
 | `abs(x)` | `fabsf` / `fabs`; a wrapping helper on `i32` | `abs(INT32_MIN)` wraps to `INT32_MIN`, where C's `abs` is undefined |
 | `min(a, b, ...)`, `max(a, b, ...)` | helpers, nested left to right: `b < a ? b : a` | CPython keeps the first argument unless a later one is strictly less (greater). `fmin`/`fmax` differ on NaN and signed zeros: `min(nan, 1.0)` is `nan`, `min(0.0, -0.0)` is `0.0`. Only when the module does not rebind the name. |
-| `f32(x)`, `f64(x)`, `i32(x)` | casts | `i32(x)` truncates towards zero in both languages |
+| `f32(x)`, `f64(x)` | casts | |
+| `i32(x)` of a float | `cignal_to_i32` | Truncates towards zero in both languages. A C cast is undefined for NaN and out-of-range values (C99 6.3.1.4), so C saturates and maps NaN to 0, as event arguments do. CPython raises on NaN and inf, and leaves `i32` range otherwise: both are outside the contract (5.3). |
 
 - Numeric literals take the type their context needs: `0.5` in an `f32` expression is emitted as `0.5f`.
 - Mixing `i32` and float variables without a cast is an error (`CIGNAL.MIXED_NUMERIC`), as in Vult.
@@ -244,6 +245,14 @@ An index may not contain calls. `a[i] += x` evaluates the index twice in C, so a
 ### 5.5 Identifiers
 
 Python names that are C keywords, start with `_` or `cignal_`, or end with `_` get a `_` suffix. That keeps the mapping one-to-one: `int` becomes `int_`, so a user's `int_` becomes `int__`. Generated identifiers start with `cignal_` and never end in `_`, so they cannot collide with user names. Every symbol derived from a kernel is named after it (`Lowpass_init`, `Lowpass` for the struct), sub-kernels included. `--prefix P` (`compile_kernel(..., prefix=P)`) starts all of them, and the header guard, with `P`. Without it, two generated kernels that hold sub-kernels of the same name cannot share a program: their headers share an include guard and the linker finds duplicate symbols. `tests/test_codegen.py` shows both outcomes.
+
+### 5.6 Evaluation order
+
+CPython evaluates operands, call arguments and `range` bounds left to right. C leaves operand and argument order unspecified (C99 6.5p3, 6.5.2.2p10), and `i32` arithmetic lowers to helper calls, so its operands are arguments too. A non-constant `range` stop is hoisted into a temporary, so a non-constant start is hoisted before it.
+
+A statement is order-sensitive when it calls a method of `self` or a sub-kernel and mentions `self` elsewhere. In such a statement, every field read and method call is hoisted into a `const` temporary in Python's order; other statements are emitted unchanged. `and`, `or`, `if`-`else` and chained comparisons are C sequence points, so each is hoisted whole, with its operands inline. An operand that is itself order-sensitive is an error, since hoisting it would evaluate it unconditionally. A `while` test with temporaries becomes `for (;;) { ...; if (!test) break; ... }`, and an `elif` test with temporaries nests in `else`. Delay reads and `target` do not write state, and module-level functions cannot reach it.
+
+The alternative was to reject any statement with two calls. That rejects `self.a.tick() + self.b.tick()`, a common form. `tests/fixtures/order.py` covers each case above.
 
 ## 6. C ABI
 

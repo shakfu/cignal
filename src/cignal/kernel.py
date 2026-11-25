@@ -243,12 +243,12 @@ class Kernel:
         self.init()
 
     def set_param(self, name: str, value: float) -> None:
-        """Set a parameter by host name (`x`, or `x_k` for an `Array` element), clamped like the C setter."""
+        """Set a parameter by host name (`x`, or `x_k` for an `Array` element), clamped like the C setter, NaN to lo."""
         if name not in self._slots:
             raise KeyError(f"{type(self).__name__} has no parameter {name!r}")
         slot = self._slots[name]
         p = vars(type(self))[slot[0]]
-        clamped = p.lo if value < p.lo else p.hi if value > p.hi else value
+        clamped = p.lo if not value >= p.lo else p.hi if value > p.hi else value
         if slot in self._smoothing:
             self._smoothing[slot][0] = clamped
         else:

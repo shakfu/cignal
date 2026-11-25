@@ -243,8 +243,9 @@ _HELPERS["abs_int32_t"] = """static inline int32_t cignal_abs_int32_t(int32_t a)
 }"""
 # GCC -O2 does not unroll a loop over sub-kernels, which serialises their dependency chains: 3.9x slower on
 # an 8-biquad bank (docs/dev/simd.md). clang unrolls these already, and forcing it slowed the ladders by 12%.
-# kernel.event_i32: C's float-to-int conversion is undefined for NaN and out-of-range values.
-_HELPERS["event_i32"] = """static inline int32_t cignal_event_i32(double v) {
+# `i32()` of a float and event arguments, as kernel.event_i32: C's float-to-int conversion is undefined for
+# NaN and out-of-range values (C99 6.3.1.4).
+_HELPERS["to_i32"] = """static inline int32_t cignal_to_i32(double v) {
     if (isnan(v)) return 0;
     if (v <= -2147483648.0) return INT32_MIN;
     if (v >= 2147483647.0) return INT32_MAX;
@@ -461,6 +462,8 @@ class _FunctionLowerer:
         self.assigned: set[str] = set()  # names the body assigns: never module constants, even before declared
         self.helpers: set[str] = set()  # emitted only if this function is
         self.smoothed_reads: list[ast.AST] = []  # reads of smoothed parameters, which `control` may not do
+        self.depth = 1  # indentation of the statement being lowered, where `_leaf` emits its temporaries
+        self.sequenced = False  # the statement's evaluation order is observable: see `_order_sensitive`
 
     # -- statements -------------------------------------------------------
 
@@ -496,6 +499,7 @@ class _FunctionLowerer:
     def _stmt(self, stmt: ast.stmt, depth: int) -> None:
         if isinstance(stmt, ast.Pass):
             return
+        self.depth, self.sequenced = depth, self._order_sensitive(_statement_exprs(stmt))
         if isinstance(stmt, ast.AnnAssign):
             self._ann_assign(stmt, depth)
         elif isinstance(stmt, ast.Assign):
@@ -615,7 +619,8 @@ class _FunctionLowerer:
 
     def _aug_assign(self, stmt: ast.AugAssign, depth: int) -> None:
         lhs, t, _ = self._target(stmt.target, None)
-        result = self._binop(_Expr(lhs, t), stmt.op, self._expr(stmt.value), stmt)
+        current = self._leaf(_Expr(lhs, t))  # Python reads the target before it evaluates the value
+        result = self._binop(current, stmt.op, self._expr(stmt.value), stmt)
         self._emit(depth, f"{lhs} = {self._coerce(result, t, stmt)};")
 
     def _return(self, stmt: ast.Return, depth: int) -> None:
@@ -648,6 +653,7 @@ class _FunctionLowerer:
         return expr.code
 
     def _if(self, stmt: ast.If, depth: int, prefix: str) -> None:
+        self.depth, self.sequenced = depth, self._order_sensitive([stmt.test])
         test = self._expr(stmt.test)
         if test.type != "bool" and not (test.is_const and isinstance(test.value, bool)):
             self.errors.add(RuleId.TYPE_MISMATCH, "an `if` condition must be bool", stmt.test, "compare explicitly")
@@ -655,8 +661,10 @@ class _FunctionLowerer:
         cond = self._coerce(test, "bool", stmt.test)
         self._emit(depth, f"{prefix} ({cond}) {{")
         self._block(stmt.body, depth + 1)
-        if len(stmt.orelse) == 1 and isinstance(stmt.orelse[0], ast.If):
-            self._if(stmt.orelse[0], depth, prefix="} else if")
+        # An `elif` test with temporaries is nested in `else`, so they are evaluated only when it is.
+        orelse = stmt.orelse[0] if len(stmt.orelse) == 1 else None
+        if isinstance(orelse, ast.If) and not self._order_sensitive([orelse.test]):
+            self._if(orelse, depth, prefix="} else if")
             return
         if stmt.orelse:
             self._emit(depth, "} else {")
@@ -699,10 +707,15 @@ class _FunctionLowerer:
             trips = len(values)
             proven = (min(values), max(values)) if values else (0, 0)  # an empty loop body never runs
         var = c_name(name)
+        first = self._coerce(start, "i32", call)
         bound = self._coerce(stop, "i32", call)
         if not stop.is_const:
-            temp = f"cignal_t{next(self.temps)}"
             self._emit(depth, "{")
+            if not start.is_const:  # Python evaluates the start first
+                temp = f"cignal_t{next(self.temps)}"
+                self._emit(depth + 1, f"const int32_t {temp} = {first};")
+                first = temp
+            temp = f"cignal_t{next(self.temps)}"
             self._emit(depth + 1, f"const int32_t {temp} = {bound};")
             bound, depth = temp, depth + 1
         cmp = "<" if step > 0 else ">"
@@ -710,7 +723,7 @@ class _FunctionLowerer:
         unroll = f"CIGNAL_UNROLL({trips}) " if 1 < trips <= MAX_UNROLL else ""
         if unroll:
             self.helpers.add("unroll")
-        self._emit(depth, f"{unroll}for (int32_t {var} = {self._coerce(start, 'i32', call)}; {var} {cmp} {bound}; "
+        self._emit(depth, f"{unroll}for (int32_t {var} = {first}; {var} {cmp} {bound}; "
                    f"{increment}) {{")  # fmt: skip
         self.loop_vars[name] = proven
         self.loop_depth += 1
@@ -726,6 +739,11 @@ class _FunctionLowerer:
     def _while(self, stmt: ast.While, depth: int) -> None:
         if stmt.orelse:
             self._unsupported(stmt, "`while ... else`")
+        # A test with temporaries is evaluated at the top of each pass, as Python does.
+        hoisted = self.sequenced
+        if hoisted:
+            self._emit(depth, "for (;;) {")
+            self.depth = depth + 1
         test = self._expr(stmt.test)
         if test.type != "bool" and not (test.is_const and isinstance(test.value, bool)):
             self.errors.add(RuleId.TYPE_MISMATCH, "a `while` condition must be bool", stmt.test)
@@ -734,7 +752,11 @@ class _FunctionLowerer:
                         "runs too long misses the audio deadline", stmt,
                         "prefer `for i in range(N)` with `break` when a bound is known",
                         severity=DiagnosticSeverity.WARNING)  # fmt: skip
-        self._emit(depth, f"while ({self._coerce(test, 'bool', stmt.test)}) {{")
+        cond = self._coerce(test, "bool", stmt.test)
+        if hoisted:
+            self._emit(depth + 1, f"if (!{_wrap(test, cond, _PREC_UNARY, right=True)}) break;")
+        else:
+            self._emit(depth, f"while ({cond}) {{")
         self.loop_depth += 1
         try:
             self._block(stmt.body, depth + 1)
@@ -745,6 +767,8 @@ class _FunctionLowerer:
     # -- expressions ------------------------------------------------------
 
     def _expr(self, node: ast.expr) -> _Expr:
+        if self.sequenced and _is_conditional(node) and _mentions_self(node):
+            return self._conditional_leaf(node)
         if isinstance(node, ast.Constant):
             if isinstance(node.value, (bool, int, float)):
                 return _Expr("", None, node.value)
@@ -771,7 +795,7 @@ class _FunctionLowerer:
                 if found is not None:
                     return self._tuple_index(node.value.id, *found, node)
             code, t = self._subscript(node)
-            return _Expr(code, t)
+            return self._leaf(_Expr(code, t))
         if isinstance(node, ast.Tuple):
             self._unsupported(node, "a tuple outside `return` or unpacking")
         self._unsupported(node, f"`{type(node).__name__}` expression")
@@ -797,7 +821,7 @@ class _FunctionLowerer:
         code, field_ = self._field(node)
         if field_.smooth > 0 and self._receiver(node.value) == ("self->", "self", self.kernel) and self.kernel.exported:
             self.smoothed_reads.append(node)
-        return _Expr(code, field_.type)
+        return self._leaf(_Expr(code, field_.type))
 
     def _receiver(self, node: ast.expr) -> tuple[str, str, "_KernelModel"] | None:
         """For `self` or a chain of sub-kernel fields: (field-access prefix, pointer, kernel model)."""
@@ -1234,7 +1258,7 @@ class _FunctionLowerer:
         if isinstance(signature.returns, tuple):
             self.program.tuples.add(signature.returns)
         call = f"{model.cname}_{name}({', '.join([pointer, *args])})"
-        return _Expr(call, signature.returns if signature.returns is not None else NONE)
+        return self._leaf(_Expr(call, signature.returns if signature.returns is not None else NONE))
 
     def _target_call(self, model: "_KernelModel", node: ast.Call) -> _Expr:
         """`self.target("cutoff")`: the value a parameter glides towards, which changes only between blocks."""
@@ -1250,9 +1274,9 @@ class _FunctionLowerer:
         assert name is not None
         code = f"self->cignal_target_{name}" if field_.smooth > 0 else f"self->{c_name(name)}"
         if field_.array is None:
-            return _Expr(code, field_.type)
+            return self._leaf(_Expr(code, field_.type))
         index = self._proven_index(node.args[1], self._expr(node.args[1]), field_.array[1])
-        return _Expr(f"{code}[{index}]", field_.array[0])
+        return self._leaf(_Expr(f"{code}[{index}]", field_.array[0]))
 
     def _free_call(self, name: str, node: ast.Call) -> _Expr:
         signature = self.program.free_function(name)
@@ -1292,7 +1316,7 @@ class _FunctionLowerer:
         buffer = f"{code}.buf, {size}"
         if method in ("write", "clear"):
             return _Expr(f"cignal_delay_{method}_{ctype}({', '.join([buffer, f'&{code}.pos', *args])})", NONE)
-        return _Expr(f"cignal_delay_{method}_{ctype}({', '.join([buffer, f'{code}.pos', *args])})", element)
+        return self._leaf(_Expr(f"cignal_delay_{method}_{ctype}({', '.join([buffer, f'{code}.pos', *args])})", element))
 
     def _cast(self, t: str, operand: _Expr, node: ast.AST) -> _Expr:
         if operand.type in ("bool", NONE) or isinstance(operand.type, tuple) or isinstance(operand.value, bool):
@@ -1309,6 +1333,9 @@ class _FunctionLowerer:
             return _Expr(_literal(value, t, self.target, self.errors, node), t, prec=_PREC_UNARY if negative else 16)
         if operand.type == t:
             return operand
+        if t == "i32":
+            self.helpers.add("to_i32")
+            return _Expr(f"cignal_to_i32((double){_wrap(operand, operand.code, _PREC_UNARY, right=True)})", t)
         cast = f"({self.target.ctype(t)}){_wrap(operand, operand.code, _PREC_UNARY, right=True)}"
         return _Expr(cast, t, prec=_PREC_UNARY)
 
@@ -1366,6 +1393,78 @@ class _FunctionLowerer:
         self.program.math_symbols.add(symbol)
         return _Expr(f"{symbol}(" + ", ".join(self._coerce(a, t, node) for a in args) + ")", t)
 
+    # -- evaluation order -------------------------------------------------
+    # Python evaluates operands and arguments left to right; C leaves both orders unspecified (C99 6.5p3,
+    # 6.5.2.2p10). Where a statement's order is observable, every read of kernel state and every method
+    # call is hoisted into a temporary, in Python's order.
+
+    def _order_sensitive(self, nodes: list[ast.expr]) -> bool:
+        """Whether `nodes` call a method that may write state and touch state anywhere else.
+
+        `and`, `or`, `if`-`else` and chained comparisons are sequence points in C, so only their operands count.
+        """
+        if len(nodes) == 1 and _is_conditional(nodes[0]):
+            return any(self._order_sensitive([n]) for n in _operands(nodes[0]))
+        walked = [n for node in nodes for n in ast.walk(node)]
+        selfs = sum(isinstance(n, ast.Name) and n.id == "self" for n in walked)
+        return selfs >= 2 and any(self._is_effect_call(n) for n in walked)
+
+    def _is_effect_call(self, node: ast.AST) -> bool:
+        """A call of a method of `self` or a sub-kernel, which may write state; delay reads and `target` do not."""
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            return False
+        root = node.func.value
+        while isinstance(root, (ast.Attribute, ast.Subscript)):
+            root = root.value
+        if not (isinstance(root, ast.Name) and root.id == "self" and self.has_self):
+            return False
+        if node.func.attr == "target" and isinstance(node.func.value, ast.Name):
+            return False
+        if node.func.attr in ("read", "read_frac"):
+            field_ = self._static_field(node.func.value)
+            return field_ is None or field_.delay is None
+        return True
+
+    def _static_field(self, node: ast.expr) -> Field | None:
+        """The field `self.a.b` or `self.a[i]` names, resolved without lowering anything."""
+        if isinstance(node, ast.Subscript):
+            node = node.value
+        if not isinstance(node, ast.Attribute):
+            return None
+        if isinstance(node.value, ast.Name):
+            model = self.kernel if node.value.id == "self" else None
+        else:
+            base = self._static_field(node.value)
+            model = self.program.models.get(base.kernel) if base is not None and base.kernel else None
+        return model.fields.get(node.attr) if model is not None else None
+
+    def _leaf(self, expr: _Expr) -> _Expr:
+        """In an order-sensitive statement, evaluate `expr` now, into a temporary."""
+        if not self.sequenced or expr.type is None or expr.type == NONE:
+            return expr
+        temp = f"cignal_t{next(self.temps)}"
+        self._emit(self.depth, f"const {self.target.ctype(expr.type)} {temp} = {expr.code};")
+        return _Expr(temp, expr.type)
+
+    def _conditional_leaf(self, node: ast.expr) -> _Expr:
+        """`and`, `or`, `if`-`else` or a chained comparison, evaluated whole into a temporary.
+
+        Its operands stay inline, since hoisting would evaluate them unconditionally. C sequences them, so
+        only an operand whose own order is observable is an error.
+        """
+        for operand in _operands(node):
+            if self._order_sensitive([operand]):
+                self.errors.add(RuleId.UNSUPPORTED_SYNTAX, f"`{ast.unparse(operand)}` calls a method and touches "
+                                "other state inside `and`, `or` or `if`-`else`, where C would not keep Python's "
+                                "evaluation order", operand, "compute it into a local first")  # fmt: skip
+                raise _Abort
+        self.sequenced = False
+        try:
+            expr = self._expr(node)
+        finally:
+            self.sequenced = True
+        return self._leaf(expr)
+
     # -- typing -----------------------------------------------------------
 
     def _unify(self, *exprs: _Expr, node: ast.AST) -> Ty | None:
@@ -1402,6 +1501,40 @@ class _FunctionLowerer:
     def _unsupported(self, node: ast.AST, what: str) -> NoReturn:
         self.errors.add(RuleId.UNSUPPORTED_SYNTAX, f"{what} is not supported", node)
         raise _Abort
+
+
+def _is_conditional(node: ast.expr) -> bool:
+    return isinstance(node, (ast.BoolOp, ast.IfExp)) or (isinstance(node, ast.Compare) and len(node.ops) > 1)
+
+
+def _operands(node: ast.expr) -> list[ast.expr]:
+    if isinstance(node, ast.BoolOp):
+        return node.values
+    if isinstance(node, ast.IfExp):
+        return [node.test, node.body, node.orelse]
+    assert isinstance(node, ast.Compare)
+    return [node.left, *node.comparators]
+
+
+def _mentions_self(node: ast.expr) -> bool:
+    return any(isinstance(n, ast.Name) and n.id == "self" for n in ast.walk(node))
+
+
+def _statement_exprs(stmt: ast.stmt) -> list[ast.expr]:
+    """The expressions a statement evaluates, in Python's order, for `_order_sensitive`."""
+    if isinstance(stmt, ast.Assign):
+        return [stmt.value, *stmt.targets]
+    if isinstance(stmt, ast.AugAssign):
+        return [stmt.target, stmt.value]
+    if isinstance(stmt, (ast.AnnAssign, ast.Return)):
+        return [stmt.value] if stmt.value is not None else []
+    if isinstance(stmt, (ast.If, ast.While)):
+        return [stmt.test]
+    if isinstance(stmt, ast.For):
+        return [stmt.iter]
+    if isinstance(stmt, ast.Expr):
+        return [stmt.value]
+    return []
 
 
 def _all_int(*exprs: _Expr) -> bool:
@@ -2076,7 +2209,7 @@ void {cname}_set_param({cname} *self, int index, {sample} value);
             for t in sorted(program.tuples | ({outputs} if len(outputs) > 1 else set()))
         ]
         if any(t == "i32" for _, s in events for t in s.params.values()):
-            program.helpers.add("event_i32")
+            program.helpers.add("to_i32")
         used = set(program.helpers).union(*(self.helpers[k] for k in self.reachable if k in self.helpers))
         used |= {dep for h in used for dep in _HELPER_DEPS.get(h, [])}
         ordered_helpers = sorted(used, key=lambda h: (h not in {d for v in _HELPER_DEPS.values() for d in v}, h))
@@ -2286,7 +2419,7 @@ void {cname}_set_param({cname} *self, int index, {sample} value);
                 t = p.array[0] if p.array else p.type or ""
                 lo, hi = (self._literal(v, t) for v in p.param)
                 v = "value" if t == "f32" else f"({self.program.target.ctype(t)})value"
-                clamp = f"{v} < {lo} ? {lo} : ({v} > {hi} ? {hi} : {v})"
+                clamp = f"!({v} >= {lo}) ? {lo} : ({v} > {hi} ? {hi} : {v})"  # NaN to lo
                 dest = f"cignal_target_{p.name}" if p.smooth > 0 else c_name(p.name)
                 dest += "" if element is None else f"[{element}]"
                 lines.append(f"    case {index}: self->{dest} = {clamp}; break;")
@@ -2333,7 +2466,7 @@ void {cname}_set_param({cname} *self, int index, {sample} value);
     def _event_arg(self, t: str, value: str) -> str:
         """A host's `sample` value as an event argument of type `t` (kernel.Kernel.event)."""
         if t == "i32":
-            return f"cignal_event_i32((double){value})"
+            return f"cignal_to_i32((double){value})"
         if t == "bool":
             return f"{value} != 0"
         return value if t == "f32" else f"({self.program.target.ctype(t)}){value}"

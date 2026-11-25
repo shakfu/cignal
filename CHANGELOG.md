@@ -8,6 +8,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 - `cignal build --manifest` writes `<stem>.cignal.json`: file names, C symbol prefix, I/O counts, parameters and events (spec 6). gen-dsp reads it to wrap a kernel as a CLAP plugin without importing cignal. Reading `K_info` at run time was the alternative, but a generator needs parameter names before anything is compiled.
 
+### Fixed
+
+- Evaluation order. C leaves the order of operands and call arguments unspecified, and every `i32` `+ - *` is a helper call, so `self.n + self.bump()` could read `self.n` after the call. A statement that calls a method and touches `self` elsewhere now hoists each state read and call into a temporary, in Python's order. An order-sensitive operand of `and`, `or` or `if`-`else` is an error. A `range` start with a non-constant stop was evaluated after the stop; it now goes first. Rejecting statements with two calls was the alternative; it rejects `self.a.tick() + self.b.tick()` (spec 5.6).
+
+- `i32(x)` of a float was a raw C cast, undefined for NaN and out-of-range values. It now saturates and maps NaN to 0, as event arguments do. CPython raises there, so neither result is part of the contract (spec 5.2).
+
+- A NaN parameter value passed the setter's clamp and stayed in filter state until `reset`. Setters now map it to `lo`, in C and in `Kernel.set_param`, as table lookups and `read_frac` already did.
+
 ## [0.1.0]
 
 ### Added

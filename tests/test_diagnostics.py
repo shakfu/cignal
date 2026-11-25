@@ -149,6 +149,15 @@ CASES = [
         8,
     ),
     (
+        # Inside a conditional operand the order cannot be fixed by hoisting.
+        RuleId.UNSUPPORTED_SYNTAX,
+        kernel(
+            "n: i32 = 0\ndef bump(self) -> i32:\n    self.n += 1\n    return self.n",
+            tick="return x if self.bump() - self.n > 0 else x",
+        ),
+        10,
+    ),
+    (
         RuleId.RECURSION,
         HEADER + "def f(a: f32) -> f32:\n    return f(a)\n" + FREE_CALLER,
         4,

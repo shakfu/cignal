@@ -178,6 +178,7 @@ CASES = [
         ),
     ),
     Case("glide.py", "Glide", ((0, "level", 440.0), (2000, "level", 0.0))),
+    Case("order.py", "Order", ((2000, "reset", 0.0),)),
     Case("wavetable.py", "Wavetable", ((1700, "freq", 1234.5), (3100, "reset", 0.0), (3900, "freq", 99.0))),
 ]
 

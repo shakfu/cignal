@@ -252,7 +252,7 @@ def test_an_f64_param_keeps_its_value_target_and_step_in_double_in_the_float_bui
     source = kernel.header + kernel.source
     for line in ["    double p;", "    double cignal_target_p;", "    double cignal_coef_p;",
                  "const double d = self->cignal_target_p - self->p;",
-                 "self->cignal_target_p = (double)value < 0.5 ? 0.5 : "
+                 "self->cignal_target_p = !((double)value >= 0.5) ? 0.5 : "
                  "((double)value > 2.0 ? 2.0 : (double)value);"]:  # fmt: skip
         assert line in source, line
 
@@ -290,7 +290,7 @@ def test_events_are_public_functions_with_a_dispatcher_on_the_exported_kernel_on
     assert kernel.events == [("note", ("i32", "f32"))]  # a sub-kernel's event is a plain method
     assert "void K_on_note(K *self, int32_t note, float velocity);" in kernel.header
     assert "void K_event(K *self, int index, const float *args);" in kernel.header
-    assert "case 0: K_on_note(self, cignal_event_i32((double)args[0]), args[1]); break;" in kernel.source
+    assert "case 0: K_on_note(self, cignal_to_i32((double)args[0]), args[1]); break;" in kernel.source
     assert "static inline void S_on_bump(S *self)" in kernel.source
 
 
