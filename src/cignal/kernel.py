@@ -9,7 +9,7 @@ import inspect
 import math
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Any, TypeAlias, cast
+from typing import Any, TypeAlias, cast, get_args, get_origin
 
 f32: TypeAlias = float
 f64: TypeAlias = float
@@ -56,6 +56,14 @@ def smooth_step(value: float, target: float, coef: float) -> float:
     d = target - value
     stepped = value + coef * d
     return target if stepped == value or (-SMOOTH_SNAP < d < SMOOTH_SNAP) else stepped
+
+
+def glide(value: float, target: float, coef: float) -> float:
+    """One step of a one-pole glide from `value` towards `target`, as `param(..., smooth=)` steps.
+
+    For state that is not a parameter, such as a sub-kernel's. `coef` is `1 - exp(-1 / (seconds * sample_rate))`.
+    """
+    return smooth_step(value, target, coef)
 
 
 class Table:
@@ -344,7 +352,9 @@ class Kernel:
         self._fresh = False
         self.control()
         tick = getattr(self, "tick")  # noqa: B009 - subclasses define tick; the base class does not
-        outputs: list[list[float]] = []
+        # One list per output even for n == 0, where C writes zero frames to each channel.
+        returns = inspect.get_annotations(tick, eval_str=True).get("return")
+        outputs: list[list[float]] = [[] for _ in (get_args(returns) if get_origin(returns) is tuple else [returns])]
         for i in range(n):
             for slot, (target, coef) in self._smoothing.items():
                 self._put(slot, smooth_step(self._get(slot), target, coef))
@@ -355,8 +365,6 @@ class Kernel:
                         raise OverflowError(f"{type(self).__name__}.{path} = {value} after `tick`: outside i32, "
                                             "where C wraps (spec 5.3)")  # fmt: skip
             values = result if isinstance(result, tuple) else (result,)
-            if not outputs:
-                outputs = [[] for _ in values]
             for channel, value in zip(outputs, values, strict=True):
                 if isinstance(value, complex):  # float(value) would raise without naming the cause
                     raise ValueError(

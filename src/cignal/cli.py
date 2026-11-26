@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 from .build import BuildError, build_driver, build_pd_external, build_sc_plugin, write_kernel, write_manifest
-from .compiler import compile_kernel
+from .compiler import LAYOUTS, compile_kernel
 from .diagnostics import CompileError, Diagnostic, diagnostics_to_json
 from .headers import HOSTS, FetchError, fetch
 
@@ -30,6 +30,8 @@ def main(argv: list[str] | None = None) -> int:
     build.add_argument("--sc-name", help="SuperCollider UGen name (default: Cignal + kernel name)")
     build.add_argument("--prefix", default="", help="prefix for every generated C identifier, e.g. `mylib_`")
     build.add_argument("--manifest", action="store_true", help="also write <stem>.cignal.json, the kernel API as JSON")
+    build.add_argument("--layout", choices=LAYOUTS, default="soa",
+                       help="Array[K, N] as one struct of arrays, which clang vectorises, or as N structs")  # fmt: skip
 
     fetch_headers = commands.add_parser("fetch-headers", help="download host plugin headers into the user cache")
     fetch_headers.add_argument("hosts", nargs="*", choices=sorted(HOSTS), help="default: all")
@@ -55,7 +57,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 _report(ck.warnings, args.file)
             return 0
-        ck = compile_kernel(args.file, args.kernel, prefix=args.prefix)
+        ck = compile_kernel(args.file, args.kernel, prefix=args.prefix, layout=args.layout)
         _report(ck.warnings, args.file)
         if args.shim == "driver":
             print(build_driver(args.file, args.output, compiled=ck))

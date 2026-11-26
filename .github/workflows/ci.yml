@@ -59,6 +59,75 @@ jobs:
           LIBGL_ALWAYS_SOFTWARE: "1"
           QTWEBENGINE_CHROMIUM_FLAGS: --no-sandbox --disable-gpu
 
+  macos:
+    name: macOS (clang, Apple libm)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      # The casks install Pd-*.app and SuperCollider.app into /Applications, where cignal looks for them.
+      - name: Install Pd and SuperCollider
+        run: brew install --cask pd supercollider
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      # The host tests skip when a host is missing; fail here instead.
+      - name: Check hosts
+        run: |
+          uv run python -c "
+          from cignal.build import find_pd_binary, find_scsynth
+          from pathlib import Path
+          sc = find_scsynth()
+          found = {'pd': find_pd_binary(), 'scsynth': sc, 'sclang': sc and sc.parent.parent / 'MacOS/sclang'}
+          print(found)
+          assert all(found.values()) and found['sclang'].is_file(), found
+          "
+
+      - name: Run tests
+        run: uv run pytest tests/ -v -rs
+
+  # Both layouts of every Array[K, N] kernel (docs/dev/soa.md). Fails only if their outputs differ; the
+  # timings go to the job summary, since shared runners are too noisy to gate on.
+  layout-bench:
+    name: Layout benchmark (${{ matrix.os }}, ${{ matrix.cc }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, cc: gcc }
+          - { os: ubuntu-latest, cc: clang }
+          - { os: macos-latest, cc: cc }
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Compare layouts
+        env:
+          CC: ${{ matrix.cc }}
+        run: |
+          uv run python bench/layout.py | tee layout.md
+          { echo "## ${{ matrix.os }}, ${{ matrix.cc }}"; echo; cat layout.md; } >> "$GITHUB_STEP_SUMMARY"
+
   build:
     name: Build (${{ matrix.os }}/${{ matrix.python-version }})
     needs: qa

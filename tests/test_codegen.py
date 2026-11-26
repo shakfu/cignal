@@ -4,6 +4,8 @@ import subprocess
 import textwrap
 from pathlib import Path
 
+import pytest
+
 from cignal.build import STRICT_FLAGS, cc, compile_object, write_kernel
 from cignal.compiler import compile_kernel
 
@@ -324,3 +326,31 @@ def test_header_guard_accepts_any_file_stem(tmp_path: Path) -> None:
     ck = compile_kernel(path)
     assert "#define CIGNAL_MY_GAIN_V2_H" in ck.header
     compile_object(write_kernel(ck, tmp_path / "out")[1])
+
+
+def test_an_array_of_sub_kernels_is_one_struct_of_arrays() -> None:
+    """docs/dev/soa.md: each member gets a leading lane dimension, and element `i` is lane `i`."""
+    kernel = compile_kernel(FIXTURES / "nest.py")
+    lanes = kernel.header[kernel.header.index("typedef struct Lane_x3 {") :]
+    for member in ["    Tap smooth[3];", "    Tap_x2 taps[3];", "    float gains[4][3];",
+                   "    struct { float buf[16]; int32_t pos; } lines[3][2];", "    int32_t count[3];"]:  # fmt: skip
+        assert member in lanes, member
+    assert "    Lane_x3 lanes;" in kernel.header
+    c = kernel.source
+    assert "Lane_x3_tick(&self->lanes, i, " in c and "self->lanes.count[i]" in c
+    assert "Tap_x2_tick(&self->taps[cignal_lane], j, x)" in c  # an array inside a lane
+    assert "self->gains[j][cignal_lane]" in c  # lane last: the voices' copies of one element are adjacent
+    assert "Tap_tick(&self->smooth[cignal_lane], " in c and "Tap_tick(&self->plain, x)" in c
+    assert "static void Lane_init(" not in c and "typedef struct Lane {" not in kernel.header  # only the variant
+
+
+def test_the_aos_layout_holds_one_struct_per_element() -> None:
+    kernel = compile_kernel(FIXTURES / "nest.py", layout="aos")
+    assert "    Lane lanes[3];" in kernel.header and "    Tap taps[2];" in kernel.header
+    assert "_x" not in kernel.header and "cignal_lane" not in kernel.source
+    assert "Lane_tick(&self->lanes[i], " in kernel.source and "self->lanes[i].count" in kernel.source
+
+
+def test_an_unknown_layout_is_an_error() -> None:
+    with pytest.raises(ValueError, match="layout 'simd'"):
+        compile_kernel(FIXTURES / "nest.py", layout="simd")

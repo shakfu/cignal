@@ -18,7 +18,8 @@ FIXTURES = ROOT / "tests" / "fixtures"
 REF = ROOT / "bench" / "ref"
 RUNS = 5
 KERNELS = ["Biquad", "OnePole", "Mix", "Lowpass", "Saw", "Stereo", "Echo", "Comb", "SVF", "Fir", "Drive",
-           "Wavetable", "Glide", "Ops", "Builtins", "Freeverb", "Ladder", "Voices", "Poly"]  # fmt: skip
+           "Wavetable", "Glide", "Ops", "Builtins", "Freeverb", "Gigaverb", "Ladder", "Voices", "Poly",
+           "Synth", "Bank"]  # fmt: skip
 # Hand-written equivalents: generated kernel -> (reference name, source stem).
 REFERENCES = {"Biquad": ("RefBiquad", "ref_biquad"), "Fir": ("RefFir", "ref_fir")}
 NATIVE = "-mcpu=native" if platform.machine() in ("arm64", "aarch64") else "-march=native"

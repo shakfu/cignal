@@ -179,6 +179,38 @@ CASES = [
     ),
     Case("glide.py", "Glide", ((0, "level", 440.0), (2000, "level", 0.0))),
     Case("order.py", "Order", ((2000, "reset", 0.0),)),
+    # Float SNR measured 96.4 to 99.7 dB: f32 coefficients and state in a 200 Hz biquad. In f64 it is 147 dB.
+    Case("bank.py", "Bank", min_snr_db=95.0),
+    # Sub-kernels, arrays and delay lines inside the lanes of a struct-of-arrays variant.
+    Case("nest.py", "Nest", ((900, "depth", 33.3), (2100, "reset", 0.0), (3000, "depth", 100.0))),
+    # Glides up, a retarget mid-glide, a glide to 0 that must snap before denormals, and a reset.
+    Case(
+        "portamento.py",
+        "Portamento",
+        (
+            (0, "go", (0.0, 440.0)),
+            (300, "go", (1.0, -220.0)),
+            (700, "go", (0.0, 300.0)),
+            (1200, "go", (0.0, 0.0)),
+            (3500, "reset", 0.0),
+            (3600, "go", (1.0, 1.0)),
+        ),
+    ),
+    # A set then an event at one frame; then a set, a reset and an event; then a set, an event and a reset.
+    Case(
+        "grab.py",
+        "Grab",
+        (
+            (1000, "level", 0.5),
+            (1000, "grab", ()),
+            (2000, "level", 0.25),
+            (2000, "reset", 0.0),
+            (2000, "grab", ()),
+            (3000, "level", 0.75),
+            (3000, "grab", ()),
+            (3000, "reset", 0.0),
+        ),
+    ),
     Case("wavetable.py", "Wavetable", ((1700, "freq", 1234.5), (3100, "reset", 0.0), (3900, "freq", 99.0))),
 ]
 

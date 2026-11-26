@@ -50,6 +50,7 @@ CASES = [
     (RuleId.MISSING_DEFAULT, kernel("g: f32"), 5),
     (RuleId.MISSING_TICK, HEADER + "class K(Kernel):\n    g: f32 = 0.0\n", 4),
     (RuleId.BAD_SIGNATURE, kernel(tick="pass", tick_sig="(self, x: f32) -> None"), 5),
+    (RuleId.BAD_SIGNATURE, kernel(tick_sig="(self, x: f64) -> f64"), 5),  # only a sub-kernel's may
     (RuleId.MIXED_NUMERIC, kernel("n: i32 = 0", tick="return x + self.n"), 7),
     (RuleId.TYPE_MISMATCH, kernel(tick="if x:\n    return x\nreturn x"), 6),
     (RuleId.CONSTANT_RANGE, kernel(tick="return x * 1e39"), 6),
@@ -266,6 +267,12 @@ def test_build_cli_rejects_a_host_flag_without_its_shim(tmp_path: Path, flag: st
     assert exc.value.code == 2
 
 
+def test_build_cli_layout_reaches_the_code_and_the_manifest(tmp_path: Path) -> None:
+    assert main(["build", str(FIXTURES / "nest.py"), "-o", str(tmp_path), "--layout", "aos", "--manifest"]) == 0
+    assert json.loads((tmp_path / "nest.cignal.json").read_text())["layout"] == "aos"
+    assert "    Lane lanes[3];" in (tmp_path / "nest.h").read_text()
+
+
 def test_build_cli_writes_manifest(tmp_path: Path) -> None:
     """The manifest names the files written beside it and the C symbols the header declares."""
     assert main(["build", str(FIXTURES / "synth.py"), "-o", str(tmp_path), "--prefix", "fx_", "--manifest"]) == 0
@@ -273,6 +280,7 @@ def test_build_cli_writes_manifest(tmp_path: Path) -> None:
     data = json.loads((tmp_path / "synth.cignal.json").read_text())
     assert data["format"] == 1
     assert (data["name"], data["c_name"], data["sample_type"]) == ("Synth", "fx_Synth", "float")
+    assert data["layout"] == "soa"
     assert (tmp_path / data["header"]).is_file() and (tmp_path / data["source"]).is_file()
     assert (data["n_inputs"], data["n_outputs"]) == (ck.n_inputs, ck.n_outputs)
     assert [(p["name"], p["lo"], p["hi"], p["default"]) for p in data["params"]] == [tuple(p) for p in ck.params]

@@ -119,6 +119,7 @@ uv run cignal build lowpass.py -o out --shim pd      # out/lowpass~.pd_darwin (o
 uv run cignal build lowpass.py -o out --shim sc      # out/CignalLowpass.so (.scx) and CignalLowpass.sc
 uv run cignal build lowpass.py -o out --prefix fx_   # fx_Lowpass, fx_Section, ...
 uv run cignal build lowpass.py -o out --manifest     # also out/lowpass.cignal.json, for wrapper generators
+uv run cignal build synth.py -o out --layout aos     # Array[K, N] as N structs: for GCC, which gains nothing from the default
 uv run cignal fetch-headers                          # or `pd` / `sc`: host headers into the user cache
 ```
 

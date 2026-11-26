@@ -106,7 +106,7 @@ Rules:
 | `@event` `on_<name>(self, ...) -> None` | no | by the host, between `K_process` calls | `K_on_<name>`, and `K_event` by index |
 | other methods | no | by kernel code only | `static inline` |
 
-- `tick`'s parameters set the number of audio inputs. Its return type sets the number of outputs, at least one.
+- `tick`'s parameters set the number of audio inputs. Its return type sets the number of outputs, at least one. On a sub-kernel, `tick` is a plain method, so it may take and return any scalar types: only its parent calls it.
 - Init calls down into sub-kernels in field order before the parent's own `init` runs.
 - `control` and `tick` do not call down. The parent calls its sub-kernels explicitly.
 - `control` runs at the start of every `K_process` call. Its effect is independent of the host's block size only if it computes from parameters and from fields `tick` does not change. The block-pattern tests (9.2) rely on this for the fixtures.
@@ -146,6 +146,7 @@ Rules:
 - Fields are written `taps: Array[f32, 16]` and `line: Delay[f32, 4800]`, with no default. `N` is evaluated in CPython, so any build-time expression works. Arrays are zero-filled.
 - `Array[T, N]`: `T` is any scalar type, `1 <= N <= 2**24`. Indexing must be provably in `[0, N)` (section 5.4). An array cannot be used as a value.
 - `Array[K, N]` for a kernel class `K` holds `N` sub-kernels, and `Array[Delay[T, M], N]` holds `N` delay lines. Elements are used through a proven index: `self.combs[i].tick(x)`, `self.lines[i].read(d)`. They initialise and reset in index order, at the field's place in field order. Freeverb's 8 combs need this: without it they are 8 named fields and unrolled loops.
+- `Array[K, N]` is stored as one struct of arrays, `K_xN`, where each member of `K` has N lanes. Element `i` is lane `i`. The voice loop then reads stride-1 arrays, which the C compiler can vectorise; output is bit-identical to one struct per element. An 8-biquad bank ran 2.8x faster under clang. GCC 14 does not vectorise it and gains nothing, so `--layout aos` (`compile_kernel(..., layout="aos")`) stores N structs instead; output is the same. The design and measurements are in [soa.md](soa.md).
 - `Delay[T, N]`: `T` is `f32` or `f64`, `2 <= N <= 2**24`. `kernel.Delay` defines the semantics; the C helpers follow it operation for operation.
   - `write(x)` stores the newest sample.
   - `read(d: i32)` returns the sample written `d` writes ago, with `d` clamped to `[1, N]`. `read(1)` is the newest, so `read(D)` before `write(x)` delays by exactly D samples.
@@ -217,6 +218,7 @@ Anything else is rejected with a diagnostic that names the construct.
 | `and or not`, comparisons | same | `a < b < c` becomes `a < b && b < c`, with Python's short-circuit order. Middle operands are evaluated twice, so they may not contain calls. |
 | `abs(x)` | `fabsf` / `fabs`; a wrapping helper on `i32` | `abs(INT32_MIN)` wraps to `INT32_MIN`, where C's `abs` is undefined |
 | `min(a, b, ...)`, `max(a, b, ...)` | helpers, nested left to right: `b < a ? b : a` | CPython keeps the first argument unless a later one is strictly less (greater). `fmin`/`fmax` differ on NaN and signed zeros: `min(nan, 1.0)` is `nan`, `min(0.0, -0.0)` is `0.0`. Only when the module does not rebind the name. |
+| `glide(value, target, coef)` | `cignal_glide_float` / `_double` | One step of the `param(..., smooth=)` glide, snap included (section 3.4), for state that is not a parameter, such as a sub-kernel's. `kernel.smooth_step` is the reference. |
 | `f32(x)`, `f64(x)` | casts | |
 | `i32(x)` of a float | `cignal_to_i32` | Truncates towards zero in both languages. A C cast is undefined for NaN and out-of-range values (C99 6.3.1.4), so C saturates and maps NaN to 0, as event arguments do. CPython raises on NaN and inf, and leaves `i32` range otherwise: both are outside the contract (5.3). |
 
@@ -302,7 +304,7 @@ typedef struct {
 
 ABI rules:
 
-- **The struct definition is public.** Hosts allocate it with their own allocator (`RTAlloc`, `getbytes`, or a member of a C++ object) using `sizeof` or `info.size`. cignal never allocates.
+- **The struct definition is public; its fields are not ABI.** Hosts allocate it with their own allocator (`RTAlloc`, `getbytes`, or a member of a C++ object) using `sizeof` or `info.size`. cignal never allocates. Hosts must not read or write fields: their names, order and layout may change in any version, for example to a struct-of-arrays `Array[K, N]` ([simd.md](simd.md)). Parameters and events are the only way in.
 - **`K_init` does everything needed before the first `K_process`.** It zero-fills, applies defaults, sets `sample_rate`, runs sub-kernel `init`, then runs `init`.
 - **`n` may be any value from 0 up**, and may vary between calls. Kernel state carries across calls. Processing in blocks of 64 then 64 gives the same output as one block of 128 (section 9.2).
 - **Input and output buffers may alias each other**, because Pd and other hosts process in place, and SuperCollider may reuse an input's buffer for an output. The buffer pointers are therefore not `restrict`. For each sample, the loop reads every input before it writes any output, which is safe for any pairing of channels.
@@ -311,7 +313,7 @@ ABI rules:
 - **The ABI is single-threaded**: one thread per kernel instance at a time.
 - **The header has an `extern "C"` guard**, so C++ hosts link against the C symbols. The `.c` file is compiled as C, not C++: it uses compound literals, which C++ lacks.
 
-`cignal build --manifest` also writes `<stem>.cignal.json`: the file names, `c_name`, sample type, I/O counts, parameters (`name`, `lo`, `hi`, `default`) and events (`name`, `args`). It lets a tool generate a wrapper without importing cignal or parsing C. gen-dsp reads it to build AU, CLAP, LV2, SuperCollider and VST3 plugins, and maps MIDI notes to events named `note(pitch, velocity)` and `off(pitch)`. A change that breaks a reader bumps its `format` field, now 1. The alternative, reading `K_info` at run time, gives the tool nothing at generation time, when plugin formats such as LV2 need parameter names.
+`cignal build --manifest` also writes `<stem>.cignal.json`: the file names, `c_name`, sample type, `layout`, I/O counts, parameters (`name`, `lo`, `hi`, `default`) and events (`name`, `args`). It lets a tool generate a wrapper without importing cignal or parsing C. gen-dsp reads it to build AU, CLAP, LV2, SuperCollider and VST3 plugins, and maps MIDI notes to events named `note(pitch, velocity)` and `off(pitch)`. A change that breaks a reader bumps its `format` field, now 1. The alternative, reading `K_info` at run time, gives the tool nothing at generation time, when plugin formats such as LV2 need parameter names.
 
 ## 7. Generated code quality
 
@@ -332,7 +334,7 @@ A shim is a C template filled from `K_info`, produced with `string.Template` fro
 - maps host buffers and block size to `K_process`;
 - maps host parameters, control messages or inlets to `K_set_param`;
 - allocates the kernel struct with the host's allocator;
-- sets flush-to-zero around `K_process` and restores the host's mode after (`ftz.h.in`): FTZ and DAZ in `MXCSR` on x86, `FPCR.FZ` on arm64, nothing elsewhere. Hosts differ: Debian's Pd 0.55 already runs kernels flushed, macOS Pd 0.57 does not. The probe kernel `tests/fixtures/denormal.py` computes `x * 1e-39 * 1e38`, whose denormal intermediate becomes 0 only when flushing is on. The kernel itself has no denormal handling, and the `driver` does not flush, so it stays comparable with CPython.
+- sets flush-to-zero around `K_process` and restores the host's mode after (`ftz.h.in`): FTZ and DAZ in `MXCSR` on x86, `FPCR.FZ` on arm64, `FPSCR.FZ` on 32-bit ARM with a VFP unit, nothing elsewhere. The 32-bit branch is checked by cross-compiling only; no test runs it. The `asm` statements clobber memory, so the kernel's loads and stores stay inside the window even when `K_process` is inlined: without that, clang moved a multiply after the restore. Hosts differ: Debian's Pd 0.55 already runs kernels flushed, macOS Pd 0.57 does not. The probe kernel `tests/fixtures/denormal.py` computes `x * 1e-39 * 1e38`, whose denormal intermediate becomes 0 only when flushing is on. The kernel itself has no denormal handling, and the `driver` does not flush, so it stays comparable with CPython.
 
 Shims, in order:
 
@@ -341,7 +343,7 @@ Shims, in order:
 3. **SuperCollider** (M4). `cignal build --shim sc` writes and compiles a UGen plugin (`.so` on Linux, `.scx` on macOS) and its sclang class file. Parameter names become sclang argument names, so the build rejects a name that starts with a capital, is an sclang keyword (`var`, `nil`, `thisProcess`, ...) or matches an input (`in0`).
    - The UGen name defaults to `Cignal` plus the kernel name, to stay clear of core UGens; `--sc-name` overrides it.
    - Inputs are the signal inputs, then one input per parameter, read once per block. A `reset` unit command (`/u_cmd node ugen "reset"`) calls `K_reset`.
-   - Each event is a unit command: `/u_cmd node ugen "note" 60 0.8`. An event sees the parameters as of the last block, since inputs are read in the calculation function.
+   - Each event is a unit command: `/u_cmd node ugen "note" 60 0.8`. Unit commands run between blocks, before the parameter inputs for the next block exist. The shim queues events and resets, up to 32 per block, and runs them in order after reading the inputs, so an event sees a parameter set in its block, as in Pd. A 33rd command runs the queue at once.
    - The constructor sets the first output sample to 0 instead of calling the calculation function once, as many UGens do. Running a sample in the constructor would process the first input sample twice.
    - The kernel struct sits inside the `Unit`, which scsynth allocates from its real-time pool; a delay line's buffer counts against that pool.
    - SuperCollider buffers are `float`; the shim refuses another sample type at compile time.
@@ -479,8 +481,8 @@ parse source (ast)      --> validate (CIGNAL.* diagnostics)
 
 ```
 cignal check  FILE [--kernel NAME] [--format text|json]
-cignal build  FILE [--kernel NAME] [-o DIR] [--prefix P] [--shim none|driver|pd|sc]
-              [--pd-include DIR] [--pd-name NAME~] [--sc-include DIR] [--sc-name Name]
+cignal build  FILE [--kernel NAME] [-o DIR] [--prefix P] [--layout soa|aos] [--manifest]
+              [--shim none|driver|pd|sc] [--pd-include DIR] [--pd-name NAME~] [--sc-include DIR] [--sc-name Name]
 ```
 
 `check` prints warnings and exits 0, or prints errors and exits 1; `--format json` prints the diagnostics as JSON. `build` prints warnings to stderr. `cignal test` and `--fast-math` are not implemented.
@@ -516,7 +518,7 @@ Sizing at init from the sample rate needs a size query before allocation, plus h
 3. **`i32` overflow in the reference.** Decided: `CHECK_I32` checks stored values after each `tick` (section 5.3). It needs no rewrite of the user's source, and the suite went from 48 s to 52 s. An AST rewrite asserting range on every operation was the alternative. A wrap inside an expression that the kernel masks back into range is not an error, and matches C (`ops.py`).
 4. **`f32` rounding in the reference.** Open. `numpy.float32` cannot give a bit-exact reference: NumPy computes `sin` and `tanh` itself, and differed from Apple's `sinf` on 15% and `tanhf` on 38% of 20000 inputs (macOS arm64, 2026-11-25; `exp` and `log` matched). It would also make NumPy a runtime dependency and run arithmetic at least 2x slower. A bit-exact `float` reference would have to call the libm `f` functions through ctypes, in a test-only shadow of the reference. The SNR test (9.1) stands meanwhile.
 5. **Fixed-point output** (Vult's `-real fixed`, q16.16) for Teensy and Eurorack hardware. Only if hardware targets are near-term.
-6. **Multi-channel instances for SIMD.** Measured: not needed, since `Array[K, N]` gives the parallelism ([simd.md](simd.md)). Open: whether field layout becomes ABI at v1.0. Making it not ABI would allow a struct-of-arrays `Array[K, N]` without a host change.
+6. **Multi-channel instances for SIMD.** Measured: not needed, since `Array[K, N]` gives the parallelism ([simd.md](simd.md)). Decided 2026-11-25: field layout is not ABI (section 6), so a struct-of-arrays `Array[K, N]` needs no host change. No shim reads a field. Making layout ABI was the alternative; it would let a host read state directly, which nothing needs.
 
 ## 14. Milestones
 

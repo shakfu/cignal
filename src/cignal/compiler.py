@@ -7,6 +7,7 @@ one typed walk, which also reports every unsupported construct.
 
 import ast
 import builtins
+import copy
 import importlib.util
 import inspect
 import itertools
@@ -18,10 +19,10 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
-from typing import NoReturn
+from typing import NamedTuple, NoReturn
 
 from .diagnostics import CompileError, Diagnostic, DiagnosticSeverity, RuleId, SourceSpan
-from .kernel import SMOOTH_SNAP, Array, Delay, Kernel, Param, Spec, Table, event
+from .kernel import SMOOTH_SNAP, Array, Delay, Kernel, Param, Spec, Table, event, glide, smooth_step
 
 Number = bool | int | float
 Ty = str | tuple[str, ...]  # a scalar type name, or a tuple of scalar type names
@@ -238,6 +239,13 @@ for _t in ("float", "double", "int32_t"):
         _HELPERS[f"{_name}_{_t}"] = f"""static inline {_t} cignal_{_name}_{_t}({_t} a, {_t} b) {{
     return b {_op} a ? b : a;
 }}"""
+# kernel.smooth_step, operation for operation, as the per-sample parameter step in `K_process`.
+for _t, _snap in (("float", "1e-20f"), ("double", "1e-20")):
+    _HELPERS[f"glide_{_t}"] = f"""static inline {_t} cignal_glide_{_t}({_t} value, {_t} target, {_t} coef) {{
+    const {_t} d = target - value;
+    const {_t} stepped = value + coef * d;
+    return stepped == value || (d > -{_snap} && d < {_snap}) ? target : stepped;
+}}"""
 # C's abs(INT32_MIN) is undefined; this wraps, as the spec promises for i32.
 _HELPERS["abs_int32_t"] = """static inline int32_t cignal_abs_int32_t(int32_t a) {
     return a < 0 ? (int32_t)(0u - (uint32_t)a) : a;
@@ -343,6 +351,7 @@ class CKernel:
     sample_ctype: str
     math_symbols: frozenset[str]
     c_name: str = ""  # the C identifier of the kernel: `--prefix` plus its name
+    layout: str = "soa"  # of `Array[K, N]`: see `LAYOUTS`
     events: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)  # (host name, argument types)
     warnings: list[Diagnostic] = field(default_factory=list)
 
@@ -439,6 +448,19 @@ def _type_text(t: Ty | None) -> str:
     return t or "constant"
 
 
+LANE = "cignal_lane"  # the lane parameter of a struct-of-arrays method (docs/dev/soa.md)
+LAYOUTS = ("soa", "aos")  # how `Array[K, N]` is stored: one struct of N-lane arrays, or N structs
+
+
+class _Receiver(NamedTuple):
+    """Where `self` or a sub-kernel lives: a field is `prefix + name + suffix`; calls pass `pointer` first."""
+
+    prefix: str
+    suffix: str
+    pointer: str
+    model: "_KernelModel"
+
+
 class _FunctionLowerer:
     """Lower one method body to C statements."""
 
@@ -450,7 +472,7 @@ class _FunctionLowerer:
         self.errors = kernel.errors
         self.method = method
         self.has_self = not free
-        self.key = ("", method) if free else (kernel.name, method)  # this function in the call graph
+        self.key = ("", method) if free else (kernel.key, method)  # this function in the call graph
         self.loop_depth = 0
         self.params = signature.params
         self.returns = signature.returns
@@ -480,7 +502,7 @@ class _FunctionLowerer:
             for n, t in self.locals.items()
             if n not in self.inline
         ]
-        unused = [] if self.uses_self else ["    (void)self;"]
+        unused = [] if self.uses_self else ["    (void)self;"] + ([f"    (void){LANE};"] if self.kernel.lanes else [])
         unused += [f"    (void){c_name(p)};" for p in self.params if p not in self.used]
         return unused + decls + self.lines
 
@@ -823,46 +845,56 @@ class _FunctionLowerer:
         if self.kernel.is_module(node.value, math) and node.attr in _MATH_CONSTANTS:
             return _Expr("", None, _MATH_CONSTANTS[node.attr])
         code, field_ = self._field(node)
-        if field_.smooth > 0 and self._receiver(node.value) == ("self->", "self", self.kernel) and self.kernel.exported:
+        if field_.smooth > 0 and _is_self(node.value) and self.kernel.exported:
             self.smoothed_reads.append(node)
         return self._leaf(_Expr(code, field_.type))
 
-    def _receiver(self, node: ast.expr) -> tuple[str, str, "_KernelModel"] | None:
-        """For `self` or a chain of sub-kernel fields: (field-access prefix, pointer, kernel model)."""
+    def _receiver(self, node: ast.expr) -> _Receiver | None:
+        """For `self` or a chain of sub-kernel fields and elements: where its fields live, and its model."""
         if isinstance(node, ast.Name) and node.id == "self" and self.has_self:
             self.uses_self = True
-            return "self->", "self", self.kernel
+            if self.kernel.lanes:
+                return _Receiver("self->", f"[{LANE}]", f"self, {LANE}", self.kernel)
+            return _Receiver("self->", "", "self", self.kernel)
         if isinstance(node, ast.Attribute):
             base = self._receiver(node.value)
             if base is None:
                 return None
-            prefix, _, model = base
-            field_ = model.fields.get(node.attr)
+            field_ = base.model.fields.get(node.attr)
             if field_ is not None and field_.kernel is not None and not field_.count:
-                member = f"{prefix}{c_name(node.attr)}"
-                return member + ".", f"&{member}", self.program.model(field_.kernel)
+                member = f"{base.prefix}{c_name(node.attr)}{base.suffix}"
+                return _Receiver(member + ".", "", f"&{member}", self.program.model(field_.kernel))
         if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute):
             found = self._element(node)
-            if found is not None and found[1].kernel is not None:
-                member = found[0]
-                return member + ".", f"&{member}", self.program.model(found[1].kernel)
+            if found is not None and found[2].kernel is not None:
+                array, index, field_ = found
+                kernel = found[2].kernel
+                if self.program.layout == "aos":  # element `index` is a plain struct
+                    member = f"{array}[{index}]"
+                    return _Receiver(member + ".", "", f"&{member}", self.program.model(kernel))
+                lanes = self.program.model(f"{kernel}@{field_.count}")
+                return _Receiver(array + ".", f"[{index}]", f"&{array}, {index}", lanes)
         return None
 
-    def _element(self, node: ast.Subscript) -> tuple[str, Field] | None:
-        """`self.xs[i]` for an `Array` of sub-kernels or delay lines: (C lvalue of the element, field)."""
+    def _element(self, node: ast.Subscript) -> tuple[str, str, Field] | None:
+        """`self.xs[i]` for an `Array` of sub-kernels or delay lines: (C array, proven index, field)."""
         assert isinstance(node.value, ast.Attribute)
         base = self._receiver(node.value.value)
         if base is None:
             return None
-        prefix, _, model = base
-        field_ = model.fields.get(node.value.attr)
+        field_ = base.model.fields.get(node.value.attr)
         if field_ is None or not field_.count:
             return None
         index = self._proven_index(node.slice, self._expr(node.slice), field_.count)
-        return f"{prefix}{c_name(node.value.attr)}[{index}]", field_
+        return f"{base.prefix}{c_name(node.value.attr)}{base.suffix}", index, field_
 
     def _member(self, node: ast.Attribute) -> tuple[str, Field]:
         """Resolve `self.x` or `self.sub.x` to (C lvalue, field) for a field of any kind."""
+        code, suffix, field_ = self._member_parts(node)
+        return code + suffix, field_
+
+    def _member_parts(self, node: ast.Attribute) -> tuple[str, str, Field]:
+        """`_member` split into the field and its lane index, which an `Array` element takes last."""
         base = self._receiver(node.value)
         if base is None:
             root = node.value
@@ -873,13 +905,12 @@ class _FunctionLowerer:
                                 f"`{self.method}`", node, "pass the values it needs as arguments")  # fmt: skip
                 raise _Abort
             self._unsupported(node, f"attribute `{ast.unparse(node)}`")
-        prefix, _, model = base
-        field_ = model.fields.get(node.attr)
+        field_ = base.model.fields.get(node.attr)
         if field_ is None:
             self.errors.add(RuleId.UNDECLARED_STATE, f"`{ast.unparse(node)}` is not a declared field", node,
                             f"declare it in the class body, e.g. `{node.attr}: f32 = 0.0`")  # fmt: skip
             raise _Abort
-        return f"{prefix}{c_name(node.attr)}", field_
+        return f"{base.prefix}{c_name(node.attr)}", base.suffix, field_
 
     def _field(self, node: ast.Attribute) -> tuple[str, Field]:
         """Resolve `self.x` or `self.sub.x` to (C lvalue, scalar field)."""
@@ -899,14 +930,14 @@ class _FunctionLowerer:
         """`self.a[e]` for an `Array` field, with `e` proven to be in range. Returns (C lvalue, element type)."""
         if not isinstance(node.value, ast.Attribute):
             self._unsupported(node, "subscript of anything but an `Array` field")
-        code, field_ = self._member(node.value)
+        code, lane, field_ = self._member_parts(node.value)
         if field_.array is None:
             self._unsupported(node, f"subscript of `{ast.unparse(node.value)}`, which is not an `Array`")
         element, size = field_.array
-        if field_.smooth > 0 and self._receiver(node.value.value) == ("self->", "self", self.kernel) and \
-                self.kernel.exported:  # fmt: skip
+        if field_.smooth > 0 and _is_self(node.value.value) and self.kernel.exported:
             self.smoothed_reads.append(node)
-        return f"{code}[{self._proven_index(node.slice, self._expr(node.slice), size)}]", element
+        # Lane last: `h[j][lane]`, so the voices' copies of one element are adjacent (docs/dev/soa.md).
+        return f"{code}[{self._proven_index(node.slice, self._expr(node.slice), size)}]{lane}", element
 
     def _proven_index(self, node: ast.expr, index: _Expr, size: int) -> str:
         """The C code for `index`, which must be provably in [0, size) (section 5.4)."""
@@ -1225,6 +1256,8 @@ class _FunctionLowerer:
             return self._free_call(func.id, node)
         if isinstance(func, ast.Name) and func.id in _BUILTINS and self._is_builtin(func.id):
             return self._builtin(func.id, node)
+        if isinstance(func, ast.Name) and getattr(self.kernel.module, func.id, None) is glide:
+            return self._glide(node)
         if isinstance(func, ast.Attribute):
             if self.kernel.is_module(func.value, math) and func.attr in _MATH_FUNCTIONS:
                 return self._math(func.attr, node)
@@ -1235,20 +1268,20 @@ class _FunctionLowerer:
             if (isinstance(func.value, ast.Subscript) and isinstance(func.value.value, ast.Attribute)
                     and func.attr in _DELAY_METHODS):  # fmt: skip
                 found = self._element(func.value)
-                if found is not None and found[1].delay is not None:
-                    return self._delay_call(found[0], found[1].delay, func.attr, node)
+                if found is not None and found[2].delay is not None:
+                    return self._delay_call(f"{found[0]}[{found[1]}]", found[2].delay, func.attr, node)
             receiver = self._receiver(func.value)
             if receiver is not None and func.attr == "target":
-                return self._target_call(receiver[2], node)
+                return self._target_call(receiver.model, node)
             if receiver is not None:
                 return self._method_call(receiver, func.attr, node)
         self.errors.add(RuleId.UNSUPPORTED_CALL, f"call to `{ast.unparse(func)}`", node,
-                        "supported: f32()/f64()/i32(), abs()/min()/max(), math." + "/".join(_MATH_FUNCTIONS) +
+                        "supported: f32()/f64()/i32(), abs()/min()/max(), glide(), math." + "/".join(_MATH_FUNCTIONS) +
                         ", and methods of this kernel or its sub-kernels")  # fmt: skip
         raise _Abort
 
-    def _method_call(self, receiver: tuple[str, str, "_KernelModel"], name: str, node: ast.Call) -> _Expr:
-        _, pointer, model = receiver
+    def _method_call(self, receiver: _Receiver, name: str, node: ast.Call) -> _Expr:
+        pointer, model = receiver.pointer, receiver.model
         signature = model.signatures.get(name)
         if signature is None or name == "init":
             why = "`init` runs automatically" if name == "init" else f"`{model.name}` has no method `{name}`"
@@ -1258,7 +1291,7 @@ class _FunctionLowerer:
             self.errors.add(RuleId.BAD_SIGNATURE, f"`{name}` takes {len(signature.params)} argument(s)", node)
             raise _Abort
         args = [self._coerce(self._expr(a), t, a) for a, t in zip(node.args, signature.params.values(), strict=True)]
-        self.program.calls.setdefault(self.key, set()).add((model.name, name))
+        self.program.calls.setdefault(self.key, set()).add((model.key, name))
         if isinstance(signature.returns, tuple):
             self.program.tuples.add(signature.returns)
         call = f"{model.cname}_{name}({', '.join([pointer, *args])})"
@@ -1375,6 +1408,22 @@ class _FunctionLowerer:
         for arg in args[1:]:
             code = f"cignal_{helper}({code}, {self._coerce(arg, t, node)})"
         return _Expr(code, t)
+
+    def _glide(self, node: ast.Call) -> _Expr:
+        if len(node.args) != 3:
+            self.errors.add(RuleId.UNSUPPORTED_CALL, "glide() takes value, target and coef", node)
+            raise _Abort
+        args = [self._expr(arg) for arg in node.args]
+        t = self._unify(*args, node=node)
+        if t is None:
+            return _Expr("", None, smooth_step(*(float(a.value) for a in args)))  # type: ignore[arg-type]
+        if t not in FLOAT_TYPES:
+            self.errors.add(RuleId.MIXED_NUMERIC, f"glide() of {_type_text(t)}", node, "cast with f32(...)")
+            raise _Abort
+        assert isinstance(t, str)
+        helper = f"glide_{self.target.ctype(t)}"
+        self.helpers.add(helper)
+        return _Expr(f"cignal_{helper}(" + ", ".join(self._coerce(a, t, node) for a in args) + ")", t)
 
     def _math(self, name: str, node: ast.Call) -> _Expr:
         if len(node.args) != _MATH_FUNCTIONS[name]:
@@ -1520,6 +1569,10 @@ def _operands(node: ast.expr) -> list[ast.expr]:
     return [node.left, *node.comparators]
 
 
+def _is_self(node: ast.expr) -> bool:
+    return isinstance(node, ast.Name) and node.id == "self"
+
+
 def _mentions_self(node: ast.expr) -> bool:
     return any(isinstance(n, ast.Name) and n.id == "self" for n in ast.walk(node))
 
@@ -1560,6 +1613,7 @@ class _KernelModel:
         self.program = program
         self.name = name
         self.exported = exported
+        self.lanes = 0  # > 0: the struct-of-arrays variant for an `Array[K, lanes]` (docs/dev/soa.md)
         self.module = program.module
         self.node = program.classes[name]
         self.cls: type = getattr(program.module, name)
@@ -1616,8 +1670,19 @@ class _KernelModel:
 
     @property
     def cname(self) -> str:
-        """The C identifier: `--prefix` plus the class name."""
-        return self.program.prefix + self.name
+        """The C identifier: `--prefix` plus the class name, plus `_xN` for a variant of N lanes."""
+        return self.program.prefix + self.name + (f"_x{self.lanes}" if self.lanes else "")
+
+    @property
+    def key(self) -> str:
+        """The call-graph name: the class name, or `K@N` for the variant of N lanes."""
+        return f"{self.name}@{self.lanes}" if self.lanes else self.name
+
+    def variant(self, lanes: int) -> "_KernelModel":
+        """The struct-of-arrays variant, sharing this model's fields and signatures."""
+        other = copy.copy(self)
+        other.lanes = lanes
+        return other
 
     @property
     def params(self) -> list[Field]:
@@ -1817,7 +1882,7 @@ def _signature(model: _KernelModel, method: ast.FunctionDef, free: bool = False)
         return Signature(params, returns, method)
     if name in ("init", "control") and (params or returns is not None):
         errors.add(RuleId.BAD_SIGNATURE, f"`{name}` takes only `self` and returns None", method)
-    if name == "tick":
+    if name == "tick" and model.exported:  # a sub-kernel's `tick` is a plain method: only its parent calls it
         outputs = returns if isinstance(returns, tuple) else (returns,)
         if any(t != "f32" for t in params.values()) or not outputs or any(t != "f32" for t in outputs):
             errors.add(RuleId.BAD_SIGNATURE, "`tick` takes f32 samples and returns f32 or tuple[f32, ...]", method)
@@ -1844,6 +1909,7 @@ class _Program:
         self.errors = errors
         self.tree = tree
         self.prefix = ""
+        self.layout = "soa"
         self.classes = dict(_kernel_classes(module, tree))
         # Module-level functions kernel code may call. They are lowered only when called, so build-time
         # helpers (filter design with SciPy, say) never need to be valid kernel code.
@@ -1973,8 +2039,11 @@ static inline {ctype} cignal_lookup_{name}({ctype} x) {{
 }}"""
 
     def model(self, name: str) -> _KernelModel:
+        """The model of kernel `name`, or of variant `K@N`."""
         if name not in self.models:
-            self.models[name] = _KernelModel(self, name, exported=name == self.exported)
+            base, _, lanes = name.partition("@")
+            self.models[name] = (self.model(base).variant(int(lanes)) if lanes
+                                 else _KernelModel(self, name, exported=name == self.exported))  # fmt: skip
         return self.models[name]
 
     def held_kernels(self) -> set[str]:
@@ -2014,7 +2083,7 @@ static inline {ctype} cignal_lookup_{name}({ctype} x) {{
 
         def visit(key: tuple[str, str]) -> None:
             state[key] = "active"
-            for callee in sorted(self.calls.get(key, ())):
+            for callee in sorted(c for c in self.calls.get(key, ()) if "@" not in c[0]):  # variants repeat it
                 if state.get(callee) == "active":
                     node = self.free_nodes[callee[1]] if not callee[0] else self.model(callee[0]).methods[callee[1]]
                     self.errors.add(RuleId.RECURSION, f"`{callee[0]}.{callee[1]}` calls itself, directly or "
@@ -2065,31 +2134,42 @@ def _kernel_classes(module: ModuleType, tree: ast.Module) -> Iterator[tuple[str,
 
 
 def compile_kernel(
-    path: str | Path, kernel: str | None = None, target: Target | None = None, prefix: str = ""
+    path: str | Path, kernel: str | None = None, target: Target | None = None, prefix: str = "", layout: str = "soa"
 ) -> CKernel:
     """Compile kernel `kernel` from `path`. Raises `CompileError` with every diagnostic found.
 
     `prefix` starts every C identifier derived from a kernel name, so two generated kernels that hold
-    sub-kernels of the same name can share a translation unit.
+    sub-kernels of the same name can share a translation unit. `layout` stores `Array[K, N]` as one
+    struct of arrays ("soa"), which clang vectorises, or as N structs ("aos"); output is identical.
     """
     if prefix and not (prefix.isidentifier() and prefix.isascii()):
         raise ValueError(f"prefix {prefix!r} must be an ASCII C identifier")
+    if layout not in LAYOUTS:
+        raise ValueError(f"layout {layout!r} must be one of {', '.join(LAYOUTS)}")
     path = Path(path)
     errors = _Errors()
     module, tree = _load_module(path, errors)
     if module is None or tree is None or errors.failed:
         raise CompileError(errors.items, str(path))
     try:
-        return _compile(module, tree, path, kernel, target or Target(), errors, prefix)
+        return _compile(module, tree, path, kernel, target or Target(), errors, prefix, layout)
     finally:
         sys.modules.pop(module.__name__, None)
 
 
 def _compile(
-    module: ModuleType, tree: ast.Module, path: Path, kernel: str | None, target: Target, errors: _Errors, prefix: str
+    module: ModuleType,
+    tree: ast.Module,
+    path: Path,
+    kernel: str | None,
+    target: Target,
+    errors: _Errors,
+    prefix: str,
+    layout: str,
 ) -> CKernel:
     program = _Program(module, tree, target, errors)
     program.prefix = prefix
+    program.layout = layout
     candidates = [name for name in program.classes if name not in program.held_kernels()]
     if kernel is None and len(candidates) == 1:
         kernel = candidates[0]
@@ -2132,15 +2212,29 @@ class _Generator:
         n_inputs = len(tick.params) if tick else 0
         outputs = tick.returns if tick is not None and isinstance(tick.returns, tuple) else ("f32",)
         program.lower_free = self._free_function
+        # `Array[K, N]` fields hold the struct-of-arrays variant `K@N`; a plain field or the export holds `K`.
+        held = [(f.kernel, f.count) for m in models for f in m.fields.values() if f.kernel is not None]
+        soa = program.layout == "soa"
+        variants = sorted({(k, n) for k, n in held if n and soa})
+        plain = {name} | {k for k, n in held if not (n and soa)}
         for model in models:
-            self._kernel_functions(model)
+            self._kernel_functions(model, lifecycle=model.name in plain)
+            # `model` alone reports errors; a variant lowered after an error would repeat it.
+            for k, n in variants if not program.errors.failed else []:
+                if k == model.name:
+                    self._kernel_functions(program.model(f"{k}@{n}"))
         program.check_recursion()
         events = [(m[3:], s) for m, s in root.signatures.items() if s.event]
         for e, s in events:
             if e in {n for n, _, _ in root.slots}:
                 program.errors.add(RuleId.BAD_SIGNATURE, f"event `{e}` has the host name of a parameter", s.node,
                                    "Pd sends both as `<name> args...`; rename one")  # fmt: skip
-        roots = {(name, "tick"), (name, "control"), *((m.name, "init") for m in models)}
+        roots = {
+            (name, "tick"),
+            (name, "control"),
+            *((k, "init") for k in plain),
+            *((f"{k}@{n}", "init") for k, n in variants),
+        }
         self.reachable = self._reachable(roots | {(name, f"on_{e}") for e, _ in events})
         for caller in sorted(self._reachable({(name, "control")})):
             for node in self.smoothed_reads.get(caller, []):
@@ -2150,10 +2244,13 @@ class _Generator:
 
         structs = []
         for model in models:
-            members = "\n".join(self._member_decl(f) for f in model.fields.values())
-            if model is root and any(p.smooth > 0 for p in root.params):
-                members += "\n    bool cignal_fresh; /* until the first process, setters also set the value */"
-            structs.append(f"typedef struct {model.cname} {{\n{members}\n}} {model.cname};\n")
+            # The plain struct only where a plain field or the export holds it: see `plain` above.
+            for lanes in [0] * (model.name in plain) + [n for k, n in variants if k == model.name]:
+                members = "\n".join(self._member_decl(f, lanes) for f in model.fields.values())
+                if model is root and any(p.smooth > 0 for p in root.params):
+                    members += "\n    bool cignal_fresh; /* until the first process, setters also set the value */"
+                cname = program.model(f"{model.name}@{lanes}").cname if lanes else model.cname
+                structs.append(f"typedef struct {cname} {{\n{members}\n}} {cname};\n")
         cname = root.cname
         params = root.params
         slots = root.slots
@@ -2246,11 +2343,13 @@ void {cname}_set_param_immediate({cname} *self, int index, {sample} value);
         info = [(n, *(p.param or (0.0, 0.0)), float(p.default)) for n, p, _ in slots]
         return CKernel(name, name_h(self.path), header, "\n".join(source), n_inputs, len(outputs),
                        [(n, lo, hi, d) for n, lo, hi, d in info], sample,
-                       frozenset(program.math_symbols), c_name=root.cname,
+                       frozenset(program.math_symbols), c_name=root.cname, layout=program.layout,
                        events=[(e, tuple(s.params.values())) for e, s in events])  # fmt: skip
 
-    def _kernel_functions(self, model: _KernelModel) -> None:
+    def _kernel_functions(self, model: _KernelModel, lifecycle: bool = True) -> None:
+        """Lower `model`'s methods. `lifecycle` adds `init` and `reset`, which are always emitted."""
         target = self.program.target
+        lane = f", int32_t {LANE}" if model.lanes else ""
         for method, signature in model.signatures.items():
             lowerer = _FunctionLowerer(model, method, signature)
             body = lowerer.lower_body(signature.node.body)
@@ -2260,19 +2359,22 @@ void {cname}_set_param_immediate({cname} *self, int index, {sample} value);
                 self.program.tuples.add(signature.returns)
             fname = f"{model.cname}_{method}_body" if method == "init" else f"{model.cname}_{method}"
             storage = "" if signature.event and model.exported else "static inline "
-            sig = f"{storage}{returns} {fname}({model.cname} *self{args})"
-            self.defined[(model.name, method)] = (len(self.defined), sig)
-            self.helpers[(model.name, method)] = lowerer.helpers
-            self.smoothed_reads[(model.name, method)] = lowerer.smoothed_reads
-            self.functions.append(((model.name, method), [sig + " {", *body, "}", ""]))
+            sig = f"{storage}{returns} {fname}({model.cname} *self{lane}{args})"
+            self.defined[(model.key, method)] = (len(self.defined), sig)
+            self.helpers[(model.key, method)] = lowerer.helpers
+            self.smoothed_reads[(model.key, method)] = lowerer.smoothed_reads
+            self.functions.append(((model.key, method), [sig + " {", *body, "}", ""]))
+        if not lifecycle:
+            return
         # Init: field defaults and the sample rate, then sub-kernels in field order, then the kernel's `init`.
         # Reset: the same without the sample rate, and keeping the exported kernel's parameters.
         # Sub-kernel init and reset are defined before every kernel that holds them: no prototypes needed.
         storage = "" if model.exported else "static "
         subs = [f for f in model.fields.values() if f.kernel is not None]
-        body = [f"    {model.cname}_init_body(self);"] if "init" in model.signatures else []
+        suffix, me = (f"[{LANE}]", f"self, {LANE}") if model.lanes else ("", "self")
+        body = [f"    {model.cname}_init_body({me});"] if "init" in model.signatures else []
         sample = target.ctype("f32")
-        init = [*self._state(model, keep_params=False), "    self->sample_rate = sample_rate;"]
+        init = [*self._state(model, keep_params=False, suffix=suffix), f"    self->sample_rate{suffix} = sample_rate;"]
         for p in model.params:
             if p.smooth > 0:
                 self.program.math_symbols.add("exp")
@@ -2283,13 +2385,17 @@ void {cname}_set_param_immediate({cname} *self, int index, {sample} value);
                          "(double)sample_rate)));"]  # fmt: skip
         if model.exported and any(p.smooth > 0 for p in model.params):
             init.append("    self->cignal_fresh = true;")
-        init += [self._each(f, f"{self._cname(f)}_init(&self->{c_name(f.name)}{{k}}, sample_rate);") for f in subs]
-        reset = self._state(model, keep_params=model.exported)
-        reset += [self._each(f, f"{self._cname(f)}_reset(&self->{c_name(f.name)}{{k}});") for f in subs]
-        self.functions.append((None, [f"{storage}void {model.cname}_init({model.cname} *self, {sample} sample_rate) {{",
+        init += [
+            self._each(f, f"{self._cname(f)}_init(&self->{c_name(f.name)}{suffix}{{k}}, sample_rate);") for f in subs
+        ]
+        reset = self._state(model, keep_params=model.exported, suffix=suffix)
+        reset += [self._each(f, f"{self._cname(f)}_reset(&self->{c_name(f.name)}{suffix}{{k}});") for f in subs]
+        unused = ["    (void)self;"] + ([f"    (void){LANE};"] if model.lanes else [])
+        head = f"{storage}void {model.cname}"
+        self.functions.append((None, [f"{head}_init({model.cname} *self{lane}, {sample} sample_rate) {{",
                                       *init, *body, "}", ""]))  # fmt: skip
-        self.functions.append((None, [f"{storage}void {model.cname}_reset({model.cname} *self) {{",
-                                      *(reset + body or ["    (void)self;"]), "}", ""]))  # fmt: skip
+        self.functions.append((None, [f"{head}_reset({model.cname} *self{lane}) {{", *(reset + body or unused),
+                                      "}", ""]))  # fmt: skip
 
     def _free_function(self, name: str, signature: Signature) -> None:
         """Lower a module-level function called from kernel code, as `static inline cignal_fn_<name>`."""
@@ -2306,42 +2412,48 @@ void {cname}_set_param_immediate({cname} *self, int index, {sample} value);
         self.helpers[("", name)] = lowerer.helpers
         self.functions.append((("", name), [sig + " {", *body, "}", ""]))
 
-    @staticmethod
-    def _each(f: Field, statement: str) -> str:
+    def _each(self, f: Field, statement: str) -> str:
         """`statement` for a sub-kernel field, looped over the elements of an `Array` of them."""
+        if f.count and f.kernel is not None and self.program.layout == "soa":  # the element is a lane argument
+            return f"    for (int32_t k = 0; k < {f.count}; k++) " + statement.format(k=", k")
         if f.count:
             return f"    for (int32_t k = 0; k < {f.count}; k++) " + statement.format(k="[k]")
         return "    " + statement.format(k="")
 
     def _cname(self, f: Field) -> str:
         assert f.kernel is not None
-        return self.program.model(f.kernel).cname
+        soa = f.count and self.program.layout == "soa"
+        return self.program.model(f"{f.kernel}@{f.count}" if soa else f.kernel).cname
 
-    def _member_decl(self, f: Field) -> str:
+    def _member_decl(self, f: Field, lanes: int = 0) -> str:
+        """A struct member; with `lanes`, each lane's copy, for a struct-of-arrays variant (docs/dev/soa.md)."""
         target = self.program.target
-        if f.kernel is not None:
-            return f"    {self._cname(f)} {c_name(f.name)}{f.c_suffix};"
+        name = c_name(f.name) + (f"[{lanes}]" if lanes else "")
+        if f.kernel is not None:  # with "soa", an `Array` of sub-kernels is one variant struct, not an array
+            return f"    {self._cname(f)} {name}{f.c_suffix if self.program.layout == 'aos' else ''};"
         if f.delay is not None:
             ctype, size = target.ctype(f.delay[0]), f.delay[1]
-            return f"    struct {{ {ctype} buf[{size}]; int32_t pos; }} {c_name(f.name)}{f.c_suffix};"
+            return f"    struct {{ {ctype} buf[{size}]; int32_t pos; }} {name}{f.c_suffix};"
         ctype = target.ctype(f.array[0] if f.array else f.type or "")
         suffix = f"[{f.array[1]}]" if f.array else ""
-        member = f"    {ctype} {c_name(f.name)}{suffix};"
+        if f.array:  # lane last, as `_subscript` indexes it
+            name = c_name(f.name) + suffix + (f"[{lanes}]" if lanes else "")
+        member = f"    {ctype} {name};"
         if f.smooth > 0 and self.program.model(self.program.exported or "").fields.get(f.name) is f:
             member += f"\n    {ctype} cignal_target_{f.name}{suffix};\n    {ctype} cignal_coef_{f.name};"
         return member
 
-    def _state(self, model: _KernelModel, keep_params: bool) -> list[str]:
+    def _state(self, model: _KernelModel, keep_params: bool, suffix: str = "") -> list[str]:
         """Assignments restoring every field except the sample rate and sub-kernels to its default."""
         target = self.program.target
         lines = []
         for f in model.fields.values():
-            name = f"self->{c_name(f.name)}"
+            name = f"self->{c_name(f.name)}{suffix}"
             if f.array is not None:
                 if keep_params and f.param is not None:
                     continue
                 fill = f.default if f.param is not None else False if f.array[0] == "bool" else 0
-                lines.append(f"    for (int32_t k = 0; k < {f.array[1]}; k++) {name}[k] = "
+                lines.append(f"    for (int32_t k = 0; k < {f.array[1]}; k++) self->{c_name(f.name)}[k]{suffix} = "
                              f"{self._literal(fill, f.array[0])};")  # fmt: skip
             elif f.delay is not None:
                 ctype = target.ctype(f.delay[0])

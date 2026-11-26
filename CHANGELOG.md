@@ -8,21 +8,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 - `cignal build --manifest` writes `<stem>.cignal.json`: file names, C symbol prefix, I/O counts, parameters and events (spec 6). gen-dsp reads it to wrap a kernel as a CLAP plugin without importing cignal. Reading `K_info` at run time was the alternative, but a generator needs parameter names before anything is compiled.
 
-- `K_set_param_immediate(k, index, v)` and `Kernel.set_param_immediate` set a smoothed parameter without a glide, for a preset or state load.
+- `K_set_param_immediate(k, index, v)` and `Kernel.set_param_immediate` set a smoothed parameter without a glide, for a preset or state load. `set_param_immediate` is a reserved method name.
 
 - A `CIGNAL.BAD_PARAM` warning for `param()` on a sub-kernel, whose range and smoothing never apply.
 
 - Spec 5.2 lists the float operations where CPython raises or goes complex and C returns inf or NaN. They are outside the contract. A complex `tick` output now raises a `ValueError` that names the cause.
 
+- `glide(value, target, coef)`: one step of the `smooth=` glide, snap included, for state that is not a parameter. A sub-kernel has no parameters, so its glides copied the snap rule by hand, or stalled short of the target in the float build. `smooth=` on plain fields was the alternative; it hides when the step runs, and a voice steps only while it plays (spec 5.2).
+
 - `cignal.kernel.CHECK_I32`: `Kernel.process` raises when a `tick` leaves an `i32` field out of range, where C wraps. The tests set it; no fixture trips it. An AST rewrite checking every operation was the alternative; it would run code other than the user's (spec 5.3, 13.3).
 
 ### Changed
 
+- The kernel struct's fields are no longer ABI. Hosts allocate it by size and reach it through parameters and events only, so the compiler may change its layout, for example to a struct-of-arrays `Array[K, N]` (spec 6).
+
+- A sub-kernel's `tick` may take and return any scalar types. The `f32` rule exists for host buffers, which only the exported kernel sees.
+
+- `Array[K, N]` of sub-kernels is stored as one struct of arrays, with N lanes per member. An `Array` of scalars inside a voice puts the lane last, so the voices' copies of one element are adjacent. Under clang, an 8-biquad bank went from 10.8 to 3.8 ns/frame at `-O2`, Poly from 21.7 to 15.2, and 8 voices of a 4-tap FIR from 19.0 to 3.5; output is bit-identical. Freeverb is 5% slower at `-O2` and level at `-O3`. GCC 14 does not vectorise the voice loop and gains nothing; the bank is 12% slower at its `-O3`. `cignal build --layout aos` keeps one struct per element, and the manifest records the layout. It is a generation option, not an `#ifdef` on the C compiler: the shim and the kernel may be built by different compilers and must agree on the struct. SoA as opt-in was the alternative; it would cost every clang user the gain to spare GCC 12% on one kernel (`docs/dev/soa.md`).
+
+- CI runs the tests on macOS too (clang, Apple libm, Pd and SuperCollider from Homebrew).
+
+- `make bench-layout` times every `Array[K, N]` fixture in both layouts, alternating the builds, and fails if their outputs differ. CI runs it on x86-64 Ubuntu with GCC and clang and on macOS, with the table in the job summary; the timings do not gate the job, since shared runners are noisy.
+
 - `--pd-name`, `--pd-include`, `--sc-name` and `--sc-include` are errors without the matching `--shim`. They were ignored.
 
-- A smoothed parameter set between `K_init` and the first `K_process` starts at that value. Shims set parameters after `K_init`, so each new Pd object or SC synth glided from the default to its creation value, and Pd repeated the glide after a sample-rate change. A flag in the struct does this, so no host needed a change; requiring hosts to call `K_set_param_immediate` was the alternative, and a host that forgot would still glide.
-
 ### Fixed
+
+- SuperCollider: an event now sees a parameter set in the same block, as in Pd. A unit command runs before the block's inputs exist, so the event used the previous block's value. The shim queues up to 32 events and resets per block and runs them once it has read the inputs. Reading the pending value from SuperCollider's `Control` unit was the alternative; it works only for an input fed directly by a `Control`.
+
+- A smoothed parameter set before the first block glided from its default. It now starts at the value set between `K_init` and the first `K_process`. Shims set parameters after `K_init`, so each new Pd object or SC synth glided from the default to its creation value, and Pd repeated the glide after a sample-rate change. A flag in the struct does this, so no host needed a change; requiring hosts to call `K_set_param_immediate` was the alternative, and a host that forgot would still glide.
 
 - Evaluation order. C leaves the order of operands and call arguments unspecified, and every `i32` `+ - *` is a helper call, so `self.n + self.bump()` could read `self.n` after the call. A statement that calls a method and touches `self` elsewhere now hoists each state read and call into a temporary, in Python's order. An order-sensitive operand of `and`, `or` or `if`-`else` is an error. A `range` start with a non-constant stop was evaluated after the stop; it now goes first. Rejecting statements with two calls was the alternative; it rejects `self.a.tick() + self.b.tick()` (spec 5.6).
 
@@ -38,11 +52,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 - `--shim sc` wrote an sclang class file that sclang rejects when a parameter was named `Gain`, `var` or `in0`. The build now reports these names (spec 8).
 
+- The shims now flush denormals on 32-bit ARM with a VFP unit (Bela, 32-bit Raspberry Pi OS), where FTZ was a no-op. This is checked by cross-compiling only.
+
+- The FTZ `asm` statements now clobber memory. Without that, clang moved inlined floating-point work out of the flushed window; a multiply ran after the host's mode was restored. The shims call `K_process` in another file, which stayed inside, so no current build was affected.
+
+- `Kernel.process(..., 0)` returned `[]`. It now returns one empty list per output, as C writes zero frames to each channel.
+
 - `make clean` deleted the extension modules in `.venv`.
 
 - Two concurrent `cignal fetch-headers` runs could fail with a traceback: the second rename met the first's directory. It now succeeds when the cache holds the verified files, and any other install failure is a fetch error.
 
-- `make docs` is gone: `docs/` has no Sphinx project. `pyproject.toml` no longer lists Python 3.15 or PyPy, which CI does not test, and its keywords were placeholders.
+- `make docs` is gone: `docs/` has no Sphinx project.
+
+- `pyproject.toml` no longer lists Python 3.15 or PyPy, which CI does not test, and its keywords were placeholders.
 
 - `make test-linux` did not copy `thirdparty/`, so 7 `test_headers` tests failed in the container.
 

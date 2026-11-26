@@ -1,6 +1,6 @@
 .PHONY: all sync build rebuild test lint lint-check format format-check \
         typecheck qa clean distclean wheel sdist dist check publish-test \
-        publish bench linux-image test-linux upgrade coverage coverage-html release help
+        publish bench bench-layout linux-image test-linux upgrade coverage coverage-html release help
 
 # Default target
 all: build
@@ -73,6 +73,10 @@ upgrade:
 
 bench:
 	@uv run python bench/run.py
+
+# Both layouts of every Array[K, N] kernel, alternating (docs/dev/soa.md); `CC=gcc make bench-layout`
+bench-layout:
+	@uv run python bench/layout.py
 
 # Linux (GCC, glibc libm, Debian's Pd) in an Apple `container` VM: `make test-linux ARCH=amd64` runs
 # x86-64 under Rosetta. The source is copied in, so the macOS .venv is never used.

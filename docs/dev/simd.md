@@ -59,5 +59,5 @@ Unrolling only the 8-voice loops left clang's ladders about 10% slower. The comp
 
 - One machine and one architecture. No x86 measurement.
 - One session of runs; machine load was not controlled.
-- SoA was hand-written; the compiler does not emit it.
+- SoA was hand-written here. The compiler emits it since 2026-11-26 ([soa.md](soa.md)).
 - The harness lived in a session scratchpad and was not kept.

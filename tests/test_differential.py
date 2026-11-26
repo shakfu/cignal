@@ -4,13 +4,16 @@ Each case applies its parameter changes mid-stream, so these also test `set_para
 """
 
 import re
+from pathlib import Path
 
 import numpy as np
 import pytest
 from conftest import Driver
-from support import CASES, SAMPLE_RATE, Case, Change, reference, run_driver, signals, snr_db
+from support import CASES, FIXTURES, SAMPLE_RATE, Case, Change, _module, reference, run_driver, signals, snr_db
 
 from cignal import Array, Kernel, f32, i32
+from cignal.build import REFERENCE_FLAGS, build_driver
+from cignal.compiler import Target, compile_kernel
 
 SIGNALS = signals()
 BLOCK_PATTERNS = ["1", "7", "64", "128", "3,61,64,1", "4800"]
@@ -176,3 +179,24 @@ def test_reference_rejects_a_stored_i32_that_c_would_wrap(kernel: type[Kernel], 
     k.process([[0.0]], 1)
     with pytest.raises(OverflowError, match=rf"{re.escape(path)} = 2147483648 after `tick`"):
         k.process([[0.0]], 1)
+
+
+@pytest.mark.parametrize(("kernel", "n_outputs"), [("Lowpass", 1), ("Glide", 2)])
+def test_reference_returns_one_list_per_output_for_zero_frames(kernel: str, n_outputs: int) -> None:
+    """C writes zero frames to each output channel; `[]` would break a caller that indexes the result."""
+    case = next(c for c in CASES if c.kernel == kernel)
+    k = getattr(_module(case.fixture), kernel)(SAMPLE_RATE)
+    assert k.process([[] for _ in range(case.info.n_inputs)], 0) == [[] for _ in range(n_outputs)]
+
+
+ARRAY_CASES = [c for c in CASES if re.search(r"\btypedef struct \w+_x\d+ \{", c.info.header)]
+
+
+@pytest.mark.parametrize("case", ARRAY_CASES, ids=str)
+def test_aos_layout_matches_cpython(tmp_path: Path, case: Case) -> None:
+    """`--layout aos` stores `Array[K, N]` as N structs; it must compute what the default layout does."""
+    compiled = compile_kernel(FIXTURES / case.fixture, case.kernel, Target(f32_ctype="double"), layout="aos")
+    assert "_x" not in compiled.header.split("typedef struct")[-1]  # the exported struct holds plain arrays
+    exe = build_driver(FIXTURES / case.fixture, tmp_path, case.kernel, extra_flags=REFERENCE_FLAGS, compiled=compiled)
+    x = SIGNALS["noise"] if case.info.n_inputs else SIGNALS["impulse"]
+    assert np.array_equal(run_driver(exe, case, x, np.float64), reference(case, x))

@@ -34,19 +34,19 @@ Design questions are argued in [`docs/dev/spec.md`](docs/dev/spec.md) section 13
 
 - [x] **`smooth=` state is `f32` in the float build.** Smoothing the voice frequency dropped the float SNR from 116 to 98 dB, because the phase integrates every rounding of the pitch. Fixed by `f64` parameters: 115 dB.
 
-- [ ] **Hand-written glides repeat the snap rule.** The ladder experiment copied `smooth_step`'s snap to avoid a float stall; the synth no longer does. Open for glides inside a sub-kernel, which has no parameters. Option: a built-in `glide(value, target, coef)`, or `smooth=` on plain fields.
+- [x] **Hand-written glides repeat the snap rule.** `glide(value, target, coef)` is the parameter step as a function (`tests/fixtures/portamento.py`).
 
 - [x] **Pd inlet count.** 19 parameters give 19 inlets. A `name value` message on the left inlet now sets any of them (`freqs_3 440`).
 
-- [ ] **A sub-kernel's `tick` must take `f32` samples**, even when only its parent calls it. The voice method is `play` to take an `f64` pitch. Minor: the rule could apply only to the exported kernel.
+- [x] **A sub-kernel's `tick` must take `f32` samples**, even when only its parent calls it. The rule now applies to the exported kernel only.
 
-- [ ] **Sub-kernels cannot read their parent.** Each voice call passes 7 shared values as arguments. Writing them into every voice in `control`, as Freeverb does, is the alternative. Minor.
+- [x] **Sub-kernels cannot read their parent.** Won't do (2026-11-25). A sub-kernel that names its parent's fields compiles only inside that one parent class, so `Voice` could not serve two synths. Arguments, or writes into each voice from `control` as Freeverb does, cover the need.
 
 ### Found by writing the event synth (2026-11-23)
 
 - [x] **Index proofs do not follow assignments out of a loop.** A local assigned only proven values now proves an index (spec 5.4).
 
-- [ ] **SuperCollider events see last block's parameters.** Inputs are read in the calculation function, after the unit command. Pd applies pending inlets first. Only matters for an event that reads a parameter set in the same block.
+- [x] **SuperCollider events see last block's parameters.** The shim now queues unit commands until it has read the block's inputs (`tests/fixtures/grab.py`).
 
 - [x] **clang rewrites `pow(2.0, x)` as `exp2(x)`.** CPython calls `pow`. The synth fixture's `2.0 ** x` matches CPython bit for bit on macOS and on glibc (GCC, arm64 and x86-64, 2026-11-25).
 
@@ -62,13 +62,13 @@ Design questions are argued in [`docs/dev/spec.md`](docs/dev/spec.md) section 13
 
 - [x] **Multi-channel instances for SIMD** (spec 13.6). Not needed: `Array[K, N]` gives the parallelism. See `docs/dev/simd.md`.
 
-- [ ] **Is field layout ABI?** Decide at the v1.0 freeze. Not ABI allows a struct-of-arrays `Array[K, N]`; ABI lets hosts read fields.
+- [x] **Is field layout ABI?** No (spec 6, 13.6). Hosts use `sizeof`, parameters and events only.
 
 - [x] **Per-voice parameters** (spec 3.4). `Array[f32, N] = param(...)`, seen by hosts as N scalar parameters.
 
 - [x] **Coefficients from smoothed parameters.** `control` reads `self.target("cutoff")`. The premise was wrong: moving the ladder's `exp` to `control` and gliding the coefficient instead left it at 83 ns/frame, since its 20 `tanh` calls dominate. A hand-written `f32` coefficient glide also cost 15 to 30 dB of float SNR (`f64` state fixed it), so the ladder keeps its smoothed cutoff.
 
-- [ ] **macOS CI job.** CI covers GCC and glibc only; clang and Apple's libm are checked only on a developer machine.
+- [x] **macOS CI job.** Pd and SuperCollider from Homebrew casks.
 
 ## Low
 
@@ -78,7 +78,7 @@ Design questions are argued in [`docs/dev/spec.md`](docs/dev/spec.md) section 13
 
 - [x] **Loops over sub-kernel arrays at GCC `-O2`.** Short constant loops are unrolled under GCC: 3.9x on the 8-biquad bank, 1.15x on Freeverb.
 
-- [ ] **Struct-of-arrays layout for `Array[K, N]`**. 1.5 to 1.9x on an 8-voice biquad bank, bit-exact (`docs/dev/simd.md`).
+- [x] **Struct-of-arrays layout for `Array[K, N]`**. 2.8x on an 8-biquad bank, 1.3 to 1.4x on Poly, bit-exact (`docs/dev/soa.md`). Freeverb is 5% slower at clang `-O2`.
 
 - [ ] **Vectorised `@table` lookups.** Untested guess: a table `tanh` is arithmetic plus an indexed load, so it may vectorise under SoA and stay bit-exact.
 

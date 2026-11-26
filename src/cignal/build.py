@@ -53,6 +53,7 @@ def kernel_manifest(kernel: CKernel) -> str:
         "header": header.name,
         "source": header.with_suffix(".c").name,
         "sample_type": kernel.sample_ctype,
+        "layout": kernel.layout,
         "n_inputs": kernel.n_inputs,
         "n_outputs": kernel.n_outputs,
         "params": [{"name": n, "lo": lo, "hi": hi, "default": d} for n, lo, hi, d in kernel.params],

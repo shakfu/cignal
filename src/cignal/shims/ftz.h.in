@@ -1,6 +1,7 @@
 /* Flush denormals to zero while the kernel runs, then restore the host's mode. Denormal arithmetic can
    cost 100x per operation, and hosts differ: Debian's Pd 0.55 runs kernels with denormals flushed,
-   macOS Pd 0.57 does not. Other targets run unchanged. */
+   macOS Pd 0.57 does not. Other targets run unchanged. The "memory" clobbers keep loads and stores, and so
+   the kernel's work on its state and buffers, between begin and end even if the kernel is inlined. */
 #if defined(__x86_64__) || defined(__i386__)
 #include <xmmintrin.h>
 typedef unsigned int cignal_fp_mode;
@@ -17,12 +18,24 @@ static inline void cignal_ftz_end(cignal_fp_mode mode) {
 typedef uint64_t cignal_fp_mode;
 static inline cignal_fp_mode cignal_ftz_begin(void) {
     uint64_t mode;
-    __asm__ __volatile__("mrs %0, fpcr" : "=r"(mode));
-    __asm__ __volatile__("msr fpcr, %0" : : "r"(mode | ((uint64_t)1 << 24))); /* FZ */
+    __asm__ __volatile__("mrs %0, fpcr" : "=r"(mode) : : "memory");
+    __asm__ __volatile__("msr fpcr, %0" : : "r"(mode | ((uint64_t)1 << 24)) : "memory"); /* FZ */
     return mode;
 }
 static inline void cignal_ftz_end(cignal_fp_mode mode) {
-    __asm__ __volatile__("msr fpcr, %0" : : "r"(mode));
+    __asm__ __volatile__("msr fpcr, %0" : : "r"(mode) : "memory");
+}
+#elif defined(__arm__) && defined(__ARM_FP) /* 32-bit ARM with a VFP unit: Bela, 32-bit Raspberry Pi OS */
+#include <stdint.h>
+typedef uint32_t cignal_fp_mode;
+static inline cignal_fp_mode cignal_ftz_begin(void) {
+    uint32_t mode;
+    __asm__ __volatile__("vmrs %0, fpscr" : "=r"(mode) : : "memory");
+    __asm__ __volatile__("vmsr fpscr, %0" : : "r"(mode | ((uint32_t)1 << 24)) : "memory"); /* FZ */
+    return mode;
+}
+static inline void cignal_ftz_end(cignal_fp_mode mode) {
+    __asm__ __volatile__("vmsr fpscr, %0" : : "r"(mode) : "memory");
 }
 #else
 typedef int cignal_fp_mode;
