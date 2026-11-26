@@ -83,4 +83,25 @@ The same A/B in the arm64 Linux container, GCC 14.2:
 | Synth | 5.10 | 5.09 | 5.09 | 5.10 |
 | Voices | 9.91 | 9.72 | 10.50 | 10.84 |
 
-GCC gains nothing from the layout, and the bank is 12% slower at `-O3`. All outputs were identical. `-fopt-info-vec` shows GCC vectorising only the bank's `init` body, not the per-sample voice loop; clang vectorises the lanes and keeps the sum serial. Disabling `CIGNAL_UNROLL` did not change it (8.50 against 8.24 at `-O2`). Getting GCC to vectorise would need differently shaped C, for example writing each lane's result to a temporary array before the sum. Not attempted.
+GCC 14 on arm64 gains nothing from the layout, and the bank is 12% slower at `-O3`. All outputs were identical. `-fopt-info-vec` shows GCC vectorising only the bank's `init` body, not the per-sample voice loop; clang vectorises the lanes and keeps the sum serial. Disabling `CIGNAL_UNROLL` did not change it (8.50 against 8.24 at `-O2`). Getting GCC to vectorise would need differently shaped C, for example writing each lane's result to a temporary array before the sum. Not attempted.
+
+### CI, x86-64 and macOS
+
+CI run 45749583254 (2026-11-26), `bench/layout.py` on GitHub's shared runners, one run each. ns per frame, each cell array-of-structs / struct-of-arrays:
+
+| kernel | GCC 15 `-O2` | GCC 15 `-O3 -march=native` | clang 21 `-O2` | clang 21 `-O3 -march=native` | Apple clang `-O2`, arm64 |
+|-|-|-|-|-|-|
+| Bank | 8.55 / 8.54 | 7.94 / 7.86 | 10.36 / 11.26 | 17.12 / 3.12 | 8.06 / 3.99 |
+| Poly | 15.52 / 15.47 | 19.86 / 19.42 | 23.37 / 23.82 | 17.32 / 10.27 | 22.26 / 15.64 |
+| Synth | 6.92 / 6.90 | 6.84 / 6.84 | 9.04 / 4.55 | 6.65 / 3.91 | 4.26 / 4.21 |
+| Voices | 14.35 / 13.84 | 14.86 / 14.35 | 14.55 / 14.26 | 14.21 / 13.74 | 10.43 / 10.26 |
+| Freeverb | 12.05 / 12.15 | 12.05 / 12.18 | 15.54 / 17.48 | 11.70 / 12.20 | 17.16 / 16.55 |
+| Gigaverb | 17.03 / 17.11 | 17.03 / 17.07 | 17.58 / 18.07 | 17.04 / 17.03 | 17.34 / 16.43 |
+
+Every pair gave identical output.
+
+- GCC 15 on x86-64 is neutral: every kernel within 4%, and the 12% loss of GCC 14 on arm64 does not appear.
+- clang on x86-64 at `-O2` is mixed: the bank 9% and Freeverb 12% slower, Synth 2x faster. At `-O3 -march=native` the bank runs 5.5x faster, Poly and Synth 1.7x. x86-64 `-O2` targets SSE2 only, which may explain the difference between the two levels; this is not verified.
+- These are single runs on shared machines. A difference under about 10% may be noise.
+
+SoA stays the default: no configuration lost more than 13% on any kernel, and three gained 1.7x to 5.5x.
