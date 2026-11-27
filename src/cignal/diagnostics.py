@@ -41,6 +41,7 @@ class RuleId:
     UNPROVEN_INDEX = "CIGNAL.UNPROVEN_INDEX"
     BAD_TABLE = "CIGNAL.BAD_TABLE"
     UNBOUNDED_LOOP = "CIGNAL.UNBOUNDED_LOOP"  # a warning
+    BLOCK_DEPENDENT = "CIGNAL.BLOCK_DEPENDENT"  # a warning: `control` reads or writes what `tick` writes
 
 
 @dataclass(frozen=True)

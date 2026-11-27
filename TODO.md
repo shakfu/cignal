@@ -48,7 +48,18 @@ Design questions are argued in [`docs/dev/spec.md`](docs/dev/spec.md) section 13
 
 - [x] **SuperCollider events see last block's parameters.** The shim now queues unit commands until it has read the block's inputs (`tests/fixtures/grab.py`).
 
-- [x] **clang rewrites `pow(2.0, x)` as `exp2(x)`.** CPython calls `pow`. The synth fixture's `2.0 ** x` matches CPython bit for bit on macOS and on glibc (GCC, arm64 and x86-64, 2026-11-25).
+- [x] **clang rewrites `pow(2.0, x)` as `exp2(x)`.** CPython calls `pow`. The synth fixture's `2.0 ** x` matched by chance; `modfilter.py` did not (Apple's `exp2` and `pow` differ on 0.19% of inputs). Fixed 2026-11-27 by calling `pow` through an asm-label alias. Not yet re-run on glibc.
+
+### Found by writing swept filters (2026-11-27)
+
+`tests/fixtures/modfilter.py`: an SVF whose cutoff follows an LFO, retuned with a `tan` and an `exp2`. ns/frame, clang `-O2`, arm64:
+
+| | per sample | counter, every 32 | hand-chunked C, every 32 | no retune |
+|-|-|-|-|-|
+| mono | 13.9 | 8.2 | 4.4 | 4.3 |
+| 8 voices | 113.1 | 14.3 | | 10.9 |
+
+- [ ] **`@every(N)` methods?** A counter field in `tick` already gives a fixed control rate that does not depend on host blocks. Lowering it as a chunked loop, with no libm call in the inner loop, made mono 1.9x faster again and bit-identical. The 8-voice bank already reaches its floor with the counter. Decide after a second kernel that needs it.
 
 ## Medium
 

@@ -101,7 +101,7 @@ Rules:
 | Method | Required | Called | C function |
 |-|-|-|-|
 | `init(self) -> None` | no | once, after fields take their defaults and `sample_rate` is set | `K_init` |
-| `control(self) -> None` | no | once per block, before the first `tick` | inside `K_process` |
+| `control(self) -> None` | no | at the start of a block, before the first `tick` | inside `K_process` |
 | `tick(self, *inputs: f32) -> f32 \| tuple[f32, ...]` | yes, on exported kernels | once per sample | `static inline` in the `.c` file |
 | `@event` `on_<name>(self, ...) -> None` | no | by the host, between `K_process` calls | `K_on_<name>`, and `K_event` by index |
 | other methods | no | by kernel code only | `static inline` |
@@ -110,6 +110,8 @@ Rules:
 - Init calls down into sub-kernels in field order before the parent's own `init` runs.
 - `control` and `tick` do not call down. The parent calls its sub-kernels explicitly.
 - `control` runs at the start of every `K_process` call. Its effect is independent of the host's block size only if it computes from parameters and from fields `tick` does not change. The block-pattern tests (9.2) rely on this for the fixtures.
+- When running `control` again could not change the state, it runs only on the first `K_process` after init, reset, a setter or an event. That holds when `control` reads no field that `tick` writes, writes no field that `tick` writes, and reads no field it writes except after writing it (`src/cignal/effects.py`). Otherwise it runs on every call. A host that calls `K_process` one frame at a time then pays for `control` once per change, not once per frame.
+- `CIGNAL.BLOCK_DEPENDENT` warns where `control` reads or writes a field `tick` writes, directly or through a method. Such a kernel's output depends on where blocks start, and the block-pattern tests (9.2) would fail on it. The warning does not cover a field `control` reads before writing it, which the analysis cannot always tell apart from a read after a write it failed to prove.
 - Methods of a kernel and its sub-kernels may call each other. The call graph must be acyclic (`CIGNAL.RECURSION`).
 - `process`, `set_param`, `set_param_immediate`, `reset`, `target` and `event` are reserved method names.
 - An event method needs both `@event` and the `on_` prefix; either alone is an error. Hosts see `<name>` without the prefix. Names Pd uses itself (`bang`, `float`, `list`, `reset`, ...) are reserved. Arguments are `f32`, `f64`, `i32` or `bool`. On a sub-kernel, an event method is a plain method its parent may call. The design is in [events.md](events.md).
@@ -460,7 +462,7 @@ Tried and reverted: `__builtin_expect` on the float `%` helper's rare branches. 
 Findings for kernel authors:
 
 - Clang turns rare branches inside a recurrence into selects, which lengthens the loop-carried chain. Float `%` in a phase accumulator costs 5.70 ns on clang and 1.63 ns on GCC. When the increment is known to be in [0, 1), `phase += inc; if phase >= 1.0: phase -= 1.0` costs 2.58 ns on clang. That form is not Python's `%` in general, so the compiler cannot make the substitution.
-- `control` runs on every block. Recomputing 16 windowed-sinc coefficients there costs about 1 ns per frame at 64-frame blocks. A kernel that wants to skip unchanged parameters can compare against a cached value in `control`. The compiler does not do this itself: skipping is equivalent only if `control` is idempotent and reads nothing `tick` writes, which needs a flow analysis M5 did not attempt.
+- `control` ran on every block when these were measured. Recomputing 16 windowed-sinc coefficients there cost about 1 ns per frame at 64-frame blocks. The compiler now skips it when nothing changed (section 3.3).
 - `-O3 -mcpu=native` changes little except the FIR (3.88 to 3.29 ns on clang, 7.10 to 4.55 ns on GCC). Native flags are not portable for distributed binaries, so the shims stay at `-O2`; `extra_flags` takes others.
 
 ## 10. Pipeline

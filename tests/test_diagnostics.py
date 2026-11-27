@@ -204,6 +204,12 @@ WARNING_CASES = [
         "        return self.s.tick(x)\n",
         5,
     ),
+    (
+        RuleId.BLOCK_DEPENDENT,
+        HEADER + "class K(Kernel):\n    s: f32 = 0.0\n    g: f32 = 0.0\n    def control(self) -> None:\n"
+        "        self.g = self.s\n    def tick(self, x: f32) -> f32:\n        self.s += x\n        return self.g\n",
+        8,
+    ),
 ]
 
 

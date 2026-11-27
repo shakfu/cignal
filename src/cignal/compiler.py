@@ -22,6 +22,7 @@ from types import ModuleType
 from typing import NamedTuple, NoReturn
 
 from .diagnostics import CompileError, Diagnostic, DiagnosticSeverity, RuleId, SourceSpan
+from .effects import analyse_control
 from .kernel import SMOOTH_SNAP, Array, Delay, Kernel, Param, Spec, Table, event, glide, smooth_step
 
 Number = bool | int | float
@@ -254,6 +255,13 @@ _HELPERS["abs_int32_t"] = """static inline int32_t cignal_abs_int32_t(int32_t a)
 # an 8-biquad bank (docs/dev/simd.md). clang unrolls these already, and forcing it slowed the ladders by 12%.
 # `i32()` of a float and event arguments, as kernel.event_i32: C's float-to-int conversion is undefined for
 # NaN and out-of-range values (C99 6.3.1.4).
+# clang rewrites pow(2, x) as exp2(x), which differs from Apple's pow on 0.2% of inputs, and pow(x, 2) as
+# x * x. CPython calls pow. A name the optimiser does not know keeps the call; the linker sees `pow`.
+_HELPERS["libm_pow"] = """#define CIGNAL_STR_(x) #x
+#define CIGNAL_STR(x) CIGNAL_STR_(x)
+double cignal_libm_pow(double, double) __asm__(CIGNAL_STR(__USER_LABEL_PREFIX__) "pow");
+float cignal_libm_powf(float, float) __asm__(CIGNAL_STR(__USER_LABEL_PREFIX__) "powf");"""
+
 _HELPERS["to_i32"] = """static inline int32_t cignal_to_i32(double v) {
     if (isnan(v)) return 0;
     if (v <= -2147483648.0) return INT32_MIN;
@@ -1143,7 +1151,8 @@ class _FunctionLowerer:
         # CPython computes float ** float with libm pow, so even a constant integer exponent calls pow.
         name = "powf" if self.target.ctype(t) == "float" else "pow"
         self.program.math_symbols.add(name)
-        return _Expr(f"{name}({self._coerce(left, t, node)}, {self._coerce(right, t, node)})", t)
+        self.helpers.add("libm_pow")
+        return _Expr(f"cignal_libm_{name}({self._coerce(left, t, node)}, {self._coerce(right, t, node)})", t)
 
     def _unary(self, node: ast.UnaryOp) -> _Expr:
         operand = self._expr(node.operand)
@@ -1444,7 +1453,11 @@ class _FunctionLowerer:
         assert isinstance(t, str)
         symbol = name + ("f" if self.target.ctype(t) == "float" else "")
         self.program.math_symbols.add(symbol)
-        return _Expr(f"{symbol}(" + ", ".join(self._coerce(a, t, node) for a in args) + ")", t)
+        call = symbol
+        if name == "pow":
+            self.helpers.add("libm_pow")
+            call = f"cignal_libm_{symbol}"
+        return _Expr(f"{call}(" + ", ".join(self._coerce(a, t, node) for a in args) + ")", t)
 
     # -- evaluation order -------------------------------------------------
     # Python evaluates operands and arguments left to right; C leaves both orders unspecified (C99 6.5p3,
@@ -2199,6 +2212,7 @@ class _Generator:
     defined: dict[tuple[str, str], tuple[int, str]] = field(default_factory=dict)
     reachable: set[tuple[str, str]] = field(default_factory=set)
     smoothed_reads: dict[tuple[str, str], list[ast.AST]] = field(default_factory=dict)
+    skip_control: bool = False  # `control` runs only after a change (effects.py)
 
     def generate(self, name: str) -> CKernel:
         program = self.program
@@ -2217,6 +2231,13 @@ class _Generator:
         soa = program.layout == "soa"
         variants = sorted({(k, n) for k, n in held if n and soa})
         plain = {name} | {k for k, n in held if not (n and soa)}
+        if "control" in root.signatures:
+            report = analyse_control(program.model, name)
+            self.skip_control = report.skippable
+            for node, message in report.hazards:
+                program.errors.add(RuleId.BLOCK_DEPENDENT, message + ", so the result depends on where blocks start",
+                                   node, "compute it in `tick`, or from parameters only",
+                                   severity=DiagnosticSeverity.WARNING)  # fmt: skip
         for model in models:
             self._kernel_functions(model, lifecycle=model.name in plain)
             # `model` alone reports errors; a variant lowered after an error would repeat it.
@@ -2249,6 +2270,8 @@ class _Generator:
                 members = "\n".join(self._member_decl(f, lanes) for f in model.fields.values())
                 if model is root and any(p.smooth > 0 for p in root.params):
                     members += "\n    bool cignal_fresh; /* until the first process, setters also set the value */"
+                if model is root and self.skip_control:
+                    members += "\n    bool cignal_stale; /* control has not run since a setter, event or reset */"
                 cname = program.model(f"{model.name}@{lanes}").cname if lanes else model.cname
                 structs.append(f"typedef struct {cname} {{\n{members}\n}} {cname};\n")
         cname = root.cname
@@ -2363,7 +2386,9 @@ void {cname}_set_param_immediate({cname} *self, int index, {sample} value);
             self.defined[(model.key, method)] = (len(self.defined), sig)
             self.helpers[(model.key, method)] = lowerer.helpers
             self.smoothed_reads[(model.key, method)] = lowerer.smoothed_reads
-            self.functions.append(((model.key, method), [sig + " {", *body, "}", ""]))
+            marks = signature.event and model.exported and self.skip_control
+            opening = [sig + " {", "    self->cignal_stale = true;"] if marks else [sig + " {"]
+            self.functions.append(((model.key, method), [*opening, *body, "}", ""]))
         if not lifecycle:
             return
         # Init: field defaults and the sample rate, then sub-kernels in field order, then the kernel's `init`.
@@ -2385,10 +2410,12 @@ void {cname}_set_param_immediate({cname} *self, int index, {sample} value);
                          "(double)sample_rate)));"]  # fmt: skip
         if model.exported and any(p.smooth > 0 for p in model.params):
             init.append("    self->cignal_fresh = true;")
+        stale = ["    self->cignal_stale = true;"] if model.exported and self.skip_control else []
+        init += stale
         init += [
             self._each(f, f"{self._cname(f)}_init(&self->{c_name(f.name)}{suffix}{{k}}, sample_rate);") for f in subs
         ]
-        reset = self._state(model, keep_params=model.exported, suffix=suffix)
+        reset = self._state(model, keep_params=model.exported, suffix=suffix) + stale
         reset += [self._each(f, f"{self._cname(f)}_reset(&self->{c_name(f.name)}{suffix}{{k}});") for f in subs]
         unused = ["    (void)self;"] + ([f"    (void){LANE};"] if model.lanes else [])
         head = f"{storage}void {model.cname}"
@@ -2505,7 +2532,11 @@ void {cname}_set_param_immediate({cname} *self, int index, {sample} value);
         lines += ["    (void)in;"] if n_inputs == 0 else []
         smoothed = any(p.smooth > 0 for p in root.params)
         lines += ["    self->cignal_fresh = false;"] if smoothed else []
-        lines += [f"    {name}_control(self);"] if "control" in root.signatures else []
+        if self.skip_control:
+            lines += ["    if (self->cignal_stale) {", "        self->cignal_stale = false;",
+                      f"        {name}_control(self);", "    }"]  # fmt: skip
+        elif "control" in root.signatures:
+            lines.append(f"    {name}_control(self);")
         args = "".join(f", in{k}" for k in range(n_inputs))
         lines += ["    for (int i = 0; i < n; i++) {"]
         for p in root.params:
@@ -2543,6 +2574,7 @@ void {cname}_set_param_immediate({cname} *self, int index, {sample} value);
             lines += [f"static void cignal_put_param({name} *self, int index, {sample} value, bool now) {{"]
         else:
             lines += [f"void {name}_set_param({name} *self, int index, {sample} value) {{"]
+        lines += ["    self->cignal_stale = true;"] if self.skip_control else []
         if slots:
             lines.append("    switch (index) {")
             for index, (_, p, element) in enumerate(slots):

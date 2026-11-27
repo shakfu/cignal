@@ -212,6 +212,15 @@ CASES = [
         ),
     ),
     Case("wavetable.py", "Wavetable", ((1700, "freq", 1234.5), (3100, "reset", 0.0), (3900, "freq", 99.0))),
+    # A faster sweep, full depth, a reset (which restarts the K kernels' retune count), then a new cutoff.
+    *(
+        Case(
+            "modfilter.py",
+            kernel,
+            ((1000, "rate", 20.0), (2000, "depth", 4.0), (2900, "reset", 0.0), (3500, "cutoff", 3000.0)),
+        )
+        for kernel in ("AutoFilter", "AutoFilterK", "AutoBank", "AutoBankK")
+    ),
 ]
 
 

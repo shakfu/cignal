@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ### Added
 
+- A `CIGNAL.BLOCK_DEPENDENT` warning where `control` reads or writes a field that `tick` writes. Output then depends on where the host's blocks start (spec 3.3), which until now only a block-pattern test would show. It is a warning, not an error: a kernel may want a per-block effect on purpose. No fixture triggers it.
+
+- Swept-filter fixtures (`tests/fixtures/modfilter.py`): an SVF retuned from an LFO every sample or every 32 samples, mono and 8-voice. They measure whether a fixed control rate pays; the results are in `TODO.md`.
+
 - `cignal build --manifest` writes `<stem>.cignal.json`: file names, C symbol prefix, I/O counts, parameters and events (spec 6). gen-dsp reads it to wrap a kernel as a CLAP plugin without importing cignal. Reading `K_info` at run time was the alternative, but a generator needs parameter names before anything is compiled.
 
 - `K_set_param_immediate(k, index, v)` and `Kernel.set_param_immediate` set a smoothed parameter without a glide, for a preset or state load. `set_param_immediate` is a reserved method name.
@@ -20,6 +24,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ### Changed
 
+- `K_process` runs `control` only when a setter, an event, init or reset ran since it last did, where the compiler proves running it again would leave the state unchanged. The proof is a field read/write analysis: `control` reads nothing `tick` writes, the two write disjoint fields, and `control` reads its own fields only after writing them. Every fixture qualifies. gen-dsp calls `K_process` one frame at a time, so Gigaverb in a graph ran its nine `pow` calls per sample: 130 ns/frame, now 25. Alone at 64-frame blocks it went from 14.1 to 12.5. Comparing parameters against cached copies was the alternative; it misses fields that events write (spec 3.3).
+
 - The kernel struct's fields are no longer ABI. Hosts allocate it by size and reach it through parameters and events only, so the compiler may change its layout, for example to a struct-of-arrays `Array[K, N]` (spec 6).
 
 - A sub-kernel's `tick` may take and return any scalar types. The `f32` rule exists for host buffers, which only the exported kernel sees.
@@ -33,6 +39,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 - `--pd-name`, `--pd-include`, `--sc-name` and `--sc-include` are errors without the matching `--shim`. They were ignored.
 
 ### Fixed
+
+- `**` and `math.pow` on floats could differ from CPython in the double build. clang rewrites `pow(2.0, x)` as `exp2(x)`, and Apple's `exp2` differs from its `pow` on 3752 of 2,000,000 inputs in [-4, 4]; it also rewrites `pow(x, 2.0)` as `x * x`. The synth fixture's inputs happened to agree. The C now calls `pow` through a declaration with an asm label, a name the optimiser does not treat as a builtin; the linker still sees `pow`. `-fno-builtin-pow` was the alternative; it is a compiler flag, and hosts build the `.c` with their own.
 
 - SuperCollider: an event now sees a parameter set in the same block, as in Pd. A unit command runs before the block's inputs exist, so the event used the previous block's value. The shim queues up to 32 events and resets per block and runs them once it has read the inputs. Reading the pending value from SuperCollider's `Control` unit was the alternative; it works only for an input fed directly by a `Control`.
 

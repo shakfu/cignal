@@ -59,7 +59,7 @@ class Lowpass(Kernel):
     q: f32 = param(0.707, lo=0.1, hi=20.0)
     section: Section  # a sub-kernel: its state is part of Lowpass's struct
 
-    def control(self) -> None:  # once per block
+    def control(self) -> None:  # at the start of a block, after a change
         w = 2.0 * math.pi * self.cutoff / self.sample_rate
         alpha = math.sin(w) / (2.0 * self.q)
         c = math.cos(w)
@@ -145,6 +145,8 @@ Both shims flush denormals to zero while the kernel runs, and restore the host's
 
 - **`Delay.read(d)` counts from 1.** `read(1)` is the newest sample, so `read(D)` before `write(x)` delays by exactly D samples.
 
+- **`control` runs at the start of a block,** before the first `tick`. It should compute from parameters and from fields `tick` does not write; otherwise output depends on where the host's blocks start, and `CIGNAL.BLOCK_DEPENDENT` warns. When the compiler proves that running it again changes nothing, it runs only after a setter, an event or a reset.
+
 - **Smoothed parameters** (`param(..., smooth=0.01)`) glide per sample. `control` may not read them, because the value it saw would depend on block size. It may read `self.target("cutoff")`, the last value set.
 
 - **`f64` parameters** (`freq: f64 = param(...)`) keep their value and glide in `double` in the float build too. Use them for a pitch that a phase integrates.
@@ -162,6 +164,8 @@ Both shims flush denormals to zero while the kernel runs, and restore the host's
 ## Performance
 
 `K_process` matches hand-written C for a biquad on clang and GCC, and beats it for a 16-tap FIR. `make bench` prints ns per sample for every fixture. Float `%` inside a recursion is slow on clang. For a phase accumulator whose increment is in [0, 1), use `phase += inc; if phase >= 1.0: phase -= 1.0`. See spec section 9.5.
+
+Skipping an unchanged `control` matters to hosts that call `K_process` with few frames. Gigaverb called one frame at a time went from 130 to 25 ns/frame, against 12.5 in 64-frame blocks (clang `-O2`, arm64).
 
 ## Tests
 
@@ -188,6 +192,7 @@ Each fixture in `tests/fixtures/` is compiled and checked four ways:
 ```text
 src/cignal/kernel.py       the Python runtime: Kernel, param, Array, Delay, table
 src/cignal/compiler.py     source -> typed walk -> C
+src/cignal/effects.py      field reads and writes per method: when `control` may be skipped
 src/cignal/build.py        writing C, rendering shims, invoking the compiler
 src/cignal/headers.py      `cignal fetch-headers`: pinned host header downloads
 src/cignal/shims/          driver, Pd, SuperCollider, benchmark and flush-to-zero templates
